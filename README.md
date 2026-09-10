@@ -112,9 +112,9 @@ cargo test -p doing-core -- --nocapture
 5. WebdriverIO Tauri E2E（计划 §10.1 的 tests/e2e 目录）未接入（P0 选型任务）；当前 UI 证据为
    截图+辅助功能读取+真实 HTTPS 契约联调（mock），命令/状态机由 Rust 单测覆盖。
 6. 服务地址默认开发 `http://127.0.0.1:8080`（`DOING_API_URL` 可覆盖）；正式地址待定（D06）。
-7. 本目录尚未 `git init` / 首次提交（等待用户确认）；`.gitignore`（含 workspace 根 `target/`）与
-   `.github/workflows/ci.yml`（已按“仓库根=本目录”修正路径过滤）均已就绪。
-   计划 P5 的“版本/源码标识”在引入版本控制前无法落定。
+7. 仓库已初始化并推送：`https://github.com/zxcodenb/doing-tauri`（public，`main`）。
+   CI 工作流 `.github/workflows/ci.yml` 因 gh OAuth 缺 `workflow` scope 暂未入库（文件保留在本地，
+   授权后补交一次即可）；P5 的“版本/源码标识”自此可基于 commit 落地。
 
 **近期修复记录（均由自动化测试/实机验收驱动）**：
 - 修复同步引擎真实死锁（读锁经 `match` 临时跨 `await`，见上）。
