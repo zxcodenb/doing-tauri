@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-move"
+description = "Enables the task_move command without any pre-configured scope."
+commands.allow = ["task_move"]
+
+[[permission]]
+identifier = "deny-task-move"
+description = "Denies the task_move command without any pre-configured scope."
+commands.deny = ["task_move"]

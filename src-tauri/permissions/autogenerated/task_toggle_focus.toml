@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-toggle-focus"
+description = "Enables the task_toggle_focus command without any pre-configured scope."
+commands.allow = ["task_toggle_focus"]
+
+[[permission]]
+identifier = "deny-task-toggle-focus"
+description = "Denies the task_toggle_focus command without any pre-configured scope."
+commands.deny = ["task_toggle_focus"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-system-toggle-mode"
+description = "Enables the system_toggle_mode command without any pre-configured scope."
+commands.allow = ["system_toggle_mode"]
+
+[[permission]]
+identifier = "deny-system-toggle-mode"
+description = "Denies the system_toggle_mode command without any pre-configured scope."
+commands.deny = ["system_toggle_mode"]

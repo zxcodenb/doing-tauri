@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/doing-core", "src-tauri"]
+default-members = ["crates/doing-core"]
+
+# 发布优化必须位于 workspace 根（成员包的 profile 会被忽略）。
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

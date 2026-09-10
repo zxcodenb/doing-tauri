@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-system-save-now"
+description = "Enables the system_save_now command without any pre-configured scope."
+commands.allow = ["system_save_now"]
+
+[[permission]]
+identifier = "deny-system-save-now"
+description = "Denies the system_save_now command without any pre-configured scope."
+commands.deny = ["system_save_now"]

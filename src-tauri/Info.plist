@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 工具型应用：不常驻 Dock、不占 Cmd-Tab（对齐旧版 .accessory 激活策略） -->
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

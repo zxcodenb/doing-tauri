@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-system-hide-main"
+description = "Enables the system_hide_main command without any pre-configured scope."
+commands.allow = ["system_hide_main"]
+
+[[permission]]
+identifier = "deny-system-hide-main"
+description = "Denies the system_hide_main command without any pre-configured scope."
+commands.deny = ["system_hide_main"]

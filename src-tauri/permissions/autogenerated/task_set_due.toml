@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-set-due"
+description = "Enables the task_set_due command without any pre-configured scope."
+commands.allow = ["task_set_due"]
+
+[[permission]]
+identifier = "deny-task-set-due"
+description = "Denies the task_set_due command without any pre-configured scope."
+commands.deny = ["task_set_due"]

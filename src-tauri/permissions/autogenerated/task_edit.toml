@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-task-edit"
+description = "Enables the task_edit command without any pre-configured scope."
+commands.allow = ["task_edit"]
+
+[[permission]]
+identifier = "deny-task-edit"
+description = "Denies the task_edit command without any pre-configured scope."
+commands.deny = ["task_edit"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-history-undo"
+description = "Enables the history_undo command without any pre-configured scope."
+commands.allow = ["history_undo"]
+
+[[permission]]
+identifier = "deny-history-undo"
+description = "Denies the history_undo command without any pre-configured scope."
+commands.deny = ["history_undo"]

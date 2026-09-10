@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-init-state"
+description = "Enables the init_state command without any pre-configured scope."
+commands.allow = ["init_state"]
+
+[[permission]]
+identifier = "deny-init-state"
+description = "Denies the init_state command without any pre-configured scope."
+commands.deny = ["init_state"]

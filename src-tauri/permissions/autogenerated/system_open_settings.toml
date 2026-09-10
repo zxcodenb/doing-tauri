@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-system-open-settings"
+description = "Enables the system_open_settings command without any pre-configured scope."
+commands.allow = ["system_open_settings"]
+
+[[permission]]
+identifier = "deny-system-open-settings"
+description = "Denies the system_open_settings command without any pre-configured scope."
+commands.deny = ["system_open_settings"]

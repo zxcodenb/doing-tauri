@@ -1,0 +1,115 @@
+/* Doing 设计系统（Superlist 参考风格，Doing 自有配色）。 */
+:root {
+  color-scheme: light;
+  --bg: #f8f6fb;
+  --sidebar: #f0ecf6;
+  --surface: #ffffff;
+  --surface-raised: #ede7f5;
+  --surface-pressed: #e3daef;
+  --divider: #e6dfef;
+  --stroke: #d8cfe4;
+  --text: #2c243a;
+  --text-dim: #73647f;
+  --text-faint: #7c6e88;
+  --accent: #cf442e;
+  --on-accent: #ffffff;
+  --accent-soft: #fdebe6;
+  --violet: #7544a8;
+  --violet-soft: #eee5fb;
+  --focus: #e5d9fc;
+  --focus-text: #342047;
+  --focus-dim: #624474;
+  --focus-stroke: #9675ac;
+  --danger: #b13626;
+  --danger-soft: #fbeae5;
+  --warn: #936016;
+  --success: #3a745a;
+  --marker: #998aa6;
+  --shadow-panel: 0 12px 40px rgba(44, 36, 58, 0.22);
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #211e2b;
+  --sidebar: #1b1824;
+  --surface: #2c2738;
+  --surface-raised: #383044;
+  --surface-pressed: #453951;
+  --divider: #3e354c;
+  --stroke: #574967;
+  --text: #f5f0fc;
+  --text-dim: #beb0ce;
+  --text-faint: #ad9dbf;
+  --accent: #fc927c;
+  --on-accent: #31150e;
+  --accent-soft: #462d2b;
+  --violet: #c7a4fa;
+  --violet-soft: #3c2d51;
+  --focus: #bba0ee;
+  --focus-text: #291637;
+  --focus-dim: #4b315f;
+  --focus-stroke: #705185;
+  --danger: #ffaa98;
+  --danger-soft: #462b2d;
+  --warn: #e7be7d;
+  --success: #9ad6b1;
+  --marker: #9f8bb3;
+  --shadow-panel: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html,
+body {
+  background: transparent;
+}
+
+html[data-win='main'] body #root {
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
+  font-size: 14px;
+  color: var(--text);
+  background: transparent;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+
+#root {
+  background: var(--bg);
+}
+
+input,
+textarea {
+  user-select: text;
+}
+
+button {
+  font-family: inherit;
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--divider);
+  border-radius: 4px;
+}

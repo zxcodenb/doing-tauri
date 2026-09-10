@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-history-redo"
+description = "Enables the history_redo command without any pre-configured scope."
+commands.allow = ["history_redo"]
+
+[[permission]]
+identifier = "deny-history-redo"
+description = "Denies the history_redo command without any pre-configured scope."
+commands.deny = ["history_redo"]
