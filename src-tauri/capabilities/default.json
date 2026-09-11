@@ -1,8 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主面板与设置窗口的最小权限：核心窗口/通知/开机启动/外链，加全部应用命令的显式 allow",
-  "windows": ["main", "settings"],
+  "description": "\u4e3b\u9762\u677f\u4e0e\u8bbe\u7f6e\u7a97\u53e3\u7684\u6700\u5c0f\u6743\u9650\uff1a\u6838\u5fc3\u7a97\u53e3/\u901a\u77e5/\u5f00\u673a\u542f\u52a8/\u5916\u94fe\uff0c\u52a0\u5168\u90e8\u5e94\u7528\u547d\u4ee4\u7684\u663e\u5f0f allow",
+  "windows": [
+    "main",
+    "settings"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-hide",
@@ -14,7 +17,6 @@
     "core:window:allow-is-visible",
     "core:window:allow-set-always-on-top",
     "core:window:allow-set-resizable",
-    "notification:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
@@ -47,10 +49,14 @@
     "allow-system-save-now",
     "allow-system-data-path",
     "allow-system-reveal-data",
-    "allow-system-notify-clicked",
     "allow-migration-import",
+    "allow-migration-resume",
+    "allow-migration-cancel",
+    "allow-migration-keep-current",
     "allow-data-export-legacy",
     "allow-launch-at-login-get",
-    "allow-launch-at-login-set"
+    "allow-launch-at-login-set",
+    "allow-notification-permission",
+    "allow-notification-request-permission"
   ]
 }

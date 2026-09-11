@@ -78,6 +78,10 @@ impl AppSettings {
             self.menu_bar_text_limit = self.menu_bar_text_limit.clamp(1, 60);
             changed = true;
         }
+        if !self.due_soon_hours.is_finite() {
+            self.due_soon_hours = DEFAULT_DUE_SOON_HOURS;
+            changed = true;
+        }
         if !(0.25..=168.0).contains(&self.due_soon_hours) {
             self.due_soon_hours = self.due_soon_hours.clamp(0.25, 168.0);
             changed = true;

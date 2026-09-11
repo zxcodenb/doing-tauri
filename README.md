@@ -3,20 +3,22 @@
 按《tauri2-refactor-plan.md》（原仓库 `doing/docs/`）以 Tauri 2 重构 Doing 任务客户端。
 本目录独立于旧 Swift 工程（`../doing`），旧工程保留为行为参照与回滚来源。
 
-- 开发与验收状态：本文件下方「当前状态对照计划」。
+- 最新代码复核、修复证据与剩余门禁：[`docs/migration-progress.md`](docs/migration-progress.md)。
+- 历史开发与验收记录：本文件下方「当前状态对照计划」；历史绿灯不等于整个迁移计划已验收。
 - 面向用户的操作说明：`docs/manual.md`（P5 交付物，随实现同步维护）。
 
 ## 技术栈
 
 - 桌面运行时：Tauri 2（macOS WKWebView / Windows WebView2）
-- UI：React 19 + TypeScript + Vite（主面板单 WebView 常驻；设置窗口按需创建）
+- UI：React 19 + TypeScript + Vite（主面板单 WebView 常驻；设置按需创建、关闭销毁，原生重开行为仍需实机复验）
 - 业务核心：Rust `crates/doing-core`（无平台依赖，可独立测试）
 - 服务端：沿用旧 Go + MySQL（`../doing/server`）；客户端只经 Rust 访问 `/api/v1`
 
 ## 目录
 
 ```text
-crates/doing-core/   领域模型、排序、焦点、历史、原子 JSON 持久化（schemaVersion=1）
+crates/doing-core/   领域模型、排序、焦点、历史、原子 JSON 持久化（schemaVersion=2）
+crates/doing-notifications/  薄原生通知适配器：权限、OS 接受、opaque 点击标识
 src-tauri/           应用层：命令/IPC、认证与同步引擎、托盘/窗口、提醒、迁移
 src/                 React 前端：工作区、设置、登录、冲突面板、设计系统
 docs/manual.md       用户操作手册（P5 交付物）
@@ -30,7 +32,7 @@ server/              仍在旧仓库（本工程只引用协议）
 pnpm install
 pnpm tauri:dev            # 开发运行（macOS 本机）
 pnpm tauri:build          # 构建（签名/公证条件见计划 D07）
-cargo test -p doing-core  # 核心行为测试（当前 42 项）
+cargo test -p doing-core  # 核心行为测试（当前 55 项）
 cargo test -p doing-core -- --nocapture
 ./scripts/exercise-disk-full.sh  # 磁盘满演练（macOS，1MB 小卷 ENOSPC）
 ```
@@ -39,16 +41,18 @@ cargo test -p doing-core -- --nocapture
 
 - **Rust 是业务状态唯一写入方**：任务命令经 `engine::mutate_core` 原子落盘（任务与同步元数据
   同一提交边界，`data.json` + `data.json.bak` 已知良好备份），成功后广播快照事件。
-- **同步引擎**：epoch 代次使旧任务失效；session 代次隔离跨账号结果；push 串行锁；
-  409 → 拉取云端候选 → 冲突面板（本地/云端/稍后决定）；自动同步防抖 2s；
-  失败退避由全局 retry driver 驱动；未取得基线前绝不 PUT。
-- **凭据**：系统安全存储（macOS Keychain），失败可见报错，不回退明文（无 token.json 降级）。
-- **前端为只读投影**：不直接访问 Go API，只消费 `doing://` 事件与命令响应；
-  草稿/编辑态在窗口形态切换间保留（WebView 不重建）。
-- **迁移**：macOS 检测旧 `items.json` → 备份 → 解析（focusID/notifiedDueIDs 映射）→
-  原子提交；绝不写回旧文件；新版已有数据时拒绝自动导入。
-- **重启恢复**：启动时若凭据有效，按 `meta` 归属判定——同归属且有未上传修改 → 自动续传；
-  本地空 → 云端恢复/标记基线；无归属或换号 → 冲突面板挂起（绝不自动上传/覆盖）。
+- **同步引擎**：会话/操作代次与串行网络流程；已确认基线与未决候选分离；PUT 前持久化不确定标记，
+  409/未知写入先 GET 并仲裁，不盲目重放；自动同步防抖 2s、退避上限 60s，所有自动路径受设置开关约束。
+- **凭据**：系统安全存储 + 绑定随机会话 ID 的租约，旧账号网络结果不能读写新账号凭据；失败可见，不回退明文。
+  `auth-session.json` 只存随机 ID/null，不含 Token 或用户名；旧 token-only 记录需重新登录。
+- **前端为只读投影**：等待全部监听器注册后握手，按会话代次/事件修订合并；云端 i64 版本以字符串跨 IPC；
+  工作区按账号会话重建，切换窗口形态不重建，冲突候选以 UUID + 版本共同确认。
+- **偏好/提醒**：设置和坐标采用独立版本化原子仓库；原生通知被 OS 接受后才记录已提醒。UUID 路由先落盘，点击队列跨重启保留，登录/归属门禁通过且 UI 实际定位后才 ACK；协议见 [`docs/notification-delivery.md`](docs/notification-delivery.md)。
+- **迁移**：macOS 检测旧 `items.json`，确认后备份任务与可选白名单 UserDefaults → 解析/逐字段核对 →
+  journal 驱动的双文件原子发布/恢复/撤销；绝不写回旧来源，已有新版文件拒绝首次导入覆盖。
+  未完成时阻止写入与认证恢复，导入后重新登录并仲裁归属；协议见 [`docs/migration-transaction.md`](docs/migration-transaction.md)。
+- **重启恢复**：身份从安全记录恢复，数据归属使用规范化服务地址 + JWT 稳定账号 ID（不替代服务端鉴权）。
+  已变化的基线、未决候选、未知上传结果都会重新仲裁；dirty 空列表是删除，不因“本地为空”而自动恢复。
 - **类型契约（计划 P1「禁止长期手写两份契约」已落地）**：Rust DTO 经 `ts-rs` 生成
   `src/types.gen.ts`（生成器 + 漂移守卫在 `src-tauri/src/bindings.rs`，任何 DTO 改动
   未重新生成都会使 `cargo test` 失败）；`src/types.ts` 只做再导出。
@@ -57,30 +61,34 @@ cargo test -p doing-core -- --nocapture
 
 ## 当前状态对照计划 §11.2（诚实清单）
 
-自动化测试现状（`cargo test` + `pnpm test`）：
-- `doing-core` 42 项（31 单测 + 11 行为映射集成；另有 1 项磁盘满演练 `#[ignore]`，由 `scripts/exercise-disk-full.sh` 按需运行）
-- `src-tauri` 33 项（12 同步引擎「真实 TCP 脚本服务器」用例 + 3 API 客户端「刷新轮换/凭据」用例 + 12 迁移用例 + 3 提醒调度/映射用例 + 2 多显示器定位几何用例 + 1 生成物漂移守卫；另有 1 项按需重新生成 `#[ignore]`）
-- 前端 Vitest 54 项（DueStamp 相对文案 / 预设跨午夜与 DST / nextHour / 快照合并守卫 /
-  **组件交互层（Testing Library + jsdom，mock IPC）**：录入/完成/保存失败提示/行内编辑/截止弹层、
-  冲突面板「先选择后确认 + 暂缓不覆盖」、登录校验与服务端拒绝恢复、设置页回滚导出与外观保存、
-  **旧版 37 项原生交互检查的可自动化子集**（点击选中/↑↓ 导航/空格完成/回车编辑/⌘↩ 提交/Escape 取消
-  与草稿清空/退格删除/已完成折叠/行菜单设焦点与删除/⌘N 聚焦/⌘Z 撤销/登录注册回车提交与各自接口仅一次）、
-  **系统集成事件回放**（迁移横幅→导入、`doing://open-settings` 板块一次性请求与设置页消费、
-  `session-lost`→登录视图、⌘W/⌘,、模式切换）、**IME 组合守卫**（组合期间回车不提交、结束后提交） / **Rust↔TS 契约守护**：
-  事件名、生成物完整再导出与 camelCase 抽样、同步状态枚举、invoke 命令与
-  `generate_handler!` 双向一致、**build.rs 命令清单 ↔ capability allow 列表双向一致**）
+> 2026-09-11 当前工作区已验证任务/偏好事务、持久化候选、认证租约、同步竞态、IPC 握手、提醒提交顺序和无覆盖原子导出。
+> P4 已补双文件迁移 journal、白名单偏好、恢复 UI、20 检查点真实 SIGKILL、工作区坐标逻辑，以及原生通知/持久定位/ACK 和三个通知进程终止检查点；本机真实隔离 Go/MySQL 两阶段联调再次通过。
+> **P0–P6 全部目标仍未完成**：系统安全存储、双端原生/安装验收、旧用户域与多屏实机语义、登录项处理、通知安装态热冷点击和正式发布/切换条件仍未齐备。
+> 具体证据、版本格式和下一步见 [`docs/migration-progress.md`](docs/migration-progress.md)。
 
-同步引擎用例覆盖：无基线 GET→PUT(base=0)、PUT 409→冲突挂起（自动上传被阻断）→选择本地以最新版本为基线上传、**结果未知 PUT（服务器已应用但响应丢失）→failed 保留 dirty 与基线 → 重试沿用原基线 → 409 → 冲突挂起、本地数据零丢失（不盲写）**、选择云端替换本地并清史、401→清凭据→unauthorized、503→failed→retry driver 恢复、自动同步关仅本地+手动 flush、会话重置丢弃在途结果、重启恢复（同归属续传 / 无归属转冲突不传 / **未决冲突重启零请求保持**）、云端恢复期间本地编辑→转冲突候选（新工作保留）。**该测试套件在首跑中发现并修复了一个真实生产死锁**（`match st.engine.read().await.known_version` 的匹配临时将读锁存活跨越了分支内 await，随后的 `engine.write()` 自死锁）。
+本轮完整验证：
+- `cargo test --workspace --locked`：核心 **55**、应用层 **144**、原生通知库 **7** 项通过，共 **206** 项。
+- `pnpm run ci`：**102** 项 Vitest、TypeScript、Vite 构建通过（8 条 React 建议级 warning，无构建失败）。
+- Rust Clippy `-D warnings`、Windows **核心与原生通知库**交叉检查、临时卷 ENOSPC 演练通过。
+- Windows 完整桌面 cross-check 未通过：ring C 编译缺少 Windows SDK `assert.h`；不把局部通过当作 Windows 壳已验证。
+- 本轮 macOS arm64 release 桌面二进制编译通过（4m25s）；未启动、打包安装或进行原生验收。
+- 真实 Go/MySQL 两阶段受保护入口及 7 项 Python 启动器守卫通过；报告见 [`go-mysql-2026-09-11-notifications.json`](docs/evidence/go-mysql-2026-09-11-notifications.json)。
+- 忽略的类型生成/磁盘满/真实数据库入口与两个私有 kill helper 另行受控执行；迁移 20 + 通知 3 个子进程不重复加算到常规 206 项。
+- 本轮没有安装或运行新 release 产物；详见 [`通知重构证据`](docs/evidence/notifications-2026-09-11.md)。旧 [`P4 证据`](docs/evidence/p4-migration-2026-09-11.md) 保留其历史结果。
+
+### 较早原型的历史记录（不作为本轮重写产物的验收）
+
+以下保留既有原型截图、性能和安装演练，不能据此推断当前代码已在原生桌面验证。
 
 | 检查项 | 状态 |
 | --- | --- |
 | P0 高风险原型 | macOS 本机运行验证（登录页/工作区/托盘/单实例均实测）；Windows/Intel/旧系统缺设备未验证 |
-| 旧行为测试映射 | 域模型 42 项 + 应用层 33 项全绿；**旧版 37 项原生交互检查已建立映射**：16 项可自动化子集由前端组件测试覆盖（导航/编辑/删除/折叠/行菜单/快捷键/登录注册），IME 组合的逻辑守卫（组合期间提交抑制）另已自动化，真机候选窗交互与 Cmd+A 选择、系统菜单路径标注为人工验收；服务端契约 E2E 仍待 MySQL 环境 |
+| 旧行为测试映射 | 域模型 48 项 + 应用层 43 项全绿；**旧版 37 项原生交互检查已建立映射**：16 项可自动化子集由前端组件测试覆盖（导航/编辑/删除/折叠/行菜单/快捷键/登录注册），IME 组合的逻辑守卫（组合期间提交抑制）另已自动化，真机候选窗交互与 Cmd+A 选择、系统菜单路径标注为人工验收；服务端契约 E2E 仍待 MySQL 环境 |
 | 迁移/回滚演练 | 导入实现 + 导出实现（兼容旧格式，位于 `exports/`，往返解析测试）共 12 项自动化测试；写入故障矩阵新增覆盖：**磁盘满**（1MB 小卷 ENOSPC 演练通过，`scripts/exercise-disk-full.sh`）、**无写权限**（repo 层 + 导入层双层自动化）、**崩溃残留 tmp / 伪中断**（load/save 不受影响）与**损坏目标拒写**；未覆盖：真实 kill -9 时序注入、Windows 侧同矩阵 |
 | IME/快捷键/模式切换/DPI | 组合输入**逻辑守卫**已有自动化测试（组合期间回车不提交 / 结束提交，录入框与行内编辑器双覆盖），快捷键/模式切换由组件测试与 App 事件回放覆盖；**键盘注入部分可行**（实测：⌘N/⌘,/⌘A/⌫/Esc/字母数字均生效；**Return 无法送达 WebView 输入框、CJK 字符回退为 'a'**，因此“键盘录入提交”仍须真实键盘人工验收；见 `scripts/e2e-keyboard.sh` 头部结论）；托盘点击不可注入（见下）；IME 候选窗与 DPI 仍待人工 |
 | 双端截图验收 | macOS 实机截图已入库：`docs/screenshots/`（登录页浅色/深色、工作区「含逾期与同步失败态」、启动仲裁冲突面板、设置窗口通用页；dev 构建 + 启动即显示采拍，release 与 dev 共用同一前端与样式）；Windows 缺设备（本机交叉检查受 ring/cc 需 Windows C 工具链限制不可行） |
 | P5 交付物（部分） | ✅ DMG 构建与挂载/拷贝运行/删除演练、用户操作手册（`docs/manual.md`）、已知限制（本文件缺口清单）；❌ 签名/公证与版本-源码标识（等 D07 与版本控制）、安装/升级/卸载的干净机器复验、Windows 安装包 |
-| 服务端 E2E | 需要 MySQL/服务端环境（本机无 docker/mysql） |
+| 服务端 E2E（历史） | 当时缺少 MySQL；2026-09-11 已补本机隔离 Go/MySQL 真实协调器联调，见上方当前证据，仍不是双端原生 E2E |
 
 **发布版性能初测（非正式；macOS arm64，release 包，采样脚本见 `scripts/perf-*.sh`）**：
 - 空闲 5 分钟（静止登录页，20 样本）：主进程 RSS 82–111 MB、WebKit WebContent 89–148 MB
@@ -90,7 +98,7 @@ cargo test -p doing-core -- --nocapture
   主进程（Rust 壳）32 → **33 MB**（108.7 → 94.7）；主窗渲染 19 → **21 MB**（51.2 → 31.1）；
   设置窗渲染 30 → **32 MB**（48.2 → 27.3）；GPU 12 → **15 MB**（39.8 → 28.1）；
   Networking 5.7 → **6.6 MB**（14.1 → 9.4）。合计 phys_footprint ≈ **108 MB**、RSS ≈ 190 MB
-  ——RSS 含共享页，拆分后实际私有占用约为总和的一半；设置窗口因启动时即预载而存在第二个渲染进程。
+  ——RSS 含共享页，拆分后实际私有占用约为总和的一半；该历史产物的设置窗口启动预载，故有第二个渲染进程；本轮已改为懒加载，不能沿用这些数值声称新内存开销。
 - 冷启动至菜单栏托盘就绪（进程拉起→托盘项可访问，**30 次**）：P50 800 ms、P95 1097 ms（min 571 / max 2064）。
 - 二次启动唤起至窗口出现（单实例转发→present，**30 次**）：P50 534 ms、P95 765 ms（min 370 / max 798；含新进程启动，为热打开上界）。
 - 对照计划初值：菜单栏应用“就绪”路径显著优于 3s 冷启动目标方向；拆分层已补齐
@@ -102,23 +110,22 @@ cargo test -p doing-core -- --nocapture
 2. 自定义命令 ACL 已按官方方式登记（`build.rs` `AppManifest::commands` + capability 逐条 allow），
    四方一致性由契约测试守卫；**负向运行时验证已完成**：临时移除 `allow-init-state` 后应用启动停在
    「Doing 启动中…」（命令被运行期拒绝），恢复授权后正向回归通过。
-3. 托盘锚点仍为「当前显示器右上」近似（Tauri 无托盘坐标 API；多屏偏移/负坐标已修并单测）；
+3. 托盘锚点仍是显示器边缘近似；浮窗缩放/工作区算法已有隔离测试，实际多屏仍需复验；当前实现尚未消费 TrayIconEvent 提供的 rect/position，不能再归因为“Tauri 无坐标 API”；
    失焦收起 + IME 候选窗豁免需真机输入法实测（已按旧版 NSPopover 语义置顶）。
    托盘按钮由系统状态栏承载：AX/合成点击不会产生真实 NSEvent，托盘交互需**人工点击**完成最终验收
    （点击处理已兼容 Down/Up 并做 250ms 去抖）；应用窗口的合成键盘输入不受此限制（已实测，见 IME 行）。
-4. 通知链路：**投递已实测**（dev 实机：`permission_state=Granted`，两条到期任务 `show()` 提交成功，
-   授权/投递日志取证）；**点击→定位任务**仍待人工单击横幅验证（系统横幅点击无法脚本注入；
-   `onAction` 转发与数字 id→任务映射已有实现与单测覆盖逻辑侧）。
+4. 通知链路：较早 dev 原型只记录旧插件 `Granted` / `show() == Ok`；本轮源码复核确认这些返回值不能证明真实 OS 授权或接受，不能继续作为投递验收。
+   现已改为原生权限/提交、持久 UUID 路由和 UI ACK，并有跨重启/进程终止回归；**真实横幅、声音及安装态热/冷点击仍未验收**。
 5. WebdriverIO Tauri E2E（计划 §10.1 的 tests/e2e 目录）未接入（P0 选型任务）；当前 UI 证据为
-   截图+辅助功能读取+真实 HTTPS 契约联调（mock），命令/状态机由 Rust 单测覆盖。
-6. 服务地址默认开发 `http://127.0.0.1:8080`（`DOING_API_URL` 可覆盖）；正式地址待定（D06）。
+   截图+辅助功能读取+本机 HTTP mock 契约联调，命令/状态机由 Rust 单测覆盖。
+6. 开发地址默认 `http://127.0.0.1:8080`，release 默认 `https://api.invalid.invalid` 占位（不可交付为正式服务）；`DOING_API_URL` 受控环境配置与正式 HTTPS 地址仍待 D06 审查。
 7. 仓库已初始化并推送：`https://github.com/zxcodenb/doing-tauri`（public，`main`）。
    CI 工作流 `.github/workflows/ci.yml` 因 gh OAuth 缺 `workflow` scope 暂未入库（文件保留在本地，
    授权后补交一次即可）；P5 的“版本/源码标识”自此可基于 commit 落地。
 
 **近期修复记录（均由自动化测试/实机验收驱动）**：
 - 修复同步引擎真实死锁（读锁经 `match` 临时跨 `await`，见上）。
-- 统一 auth→core 锁序，消除 ABBA 风险（`maybe_auto_sync`/`resume_after_restart`）。
+- 历史上统一 auth→core 锁序（本轮进一步统一 engine→auth→core），消除 ABBA 风险（`maybe_auto_sync`/`resume_after_restart`）。
 - 启动恢复仲裁补齐：同归属续传 / 无归属或换号进入冲突（不自动上传）。
 - 多显示器定位修复：叠加显示器全局原点（含负坐标副屏），菜单栏形态/浮窗形态分别修正并补单测。
 - 菜单栏形态窗口置顶（对齐旧 NSPopover 浮层语义）；主动唤起后 1.2s 失焦宽限，避免抢焦点失败即自收起。
@@ -186,6 +193,13 @@ cargo test -p doing-core -- --nocapture
   ——本应用窗口的合成键盘事件实测有效（Esc 关闭行内编辑、⌘A+⌫ 清空录入、⌘, 唤起设置均生效），
   已在「IME/快捷键」与「托盘缺口」两处更新表述。
 
+## 本地真实 Go / MySQL 联调
+
+可复现入口与隔离边界：[`tests/go-mysql/README.md`](tests/go-mysql/README.md)。
+`python3 scripts/exercise-go-mysql.py --mysql-basedir <MySQL-8.4目录> --server-source ../doing/server`
+会建立全新私有 socket-only 数据库并启动原 Go 路由，不使用现有 DB/真实凭据、不注册系统服务。
+包含两个 Rust 测试进程，以及 MySQL/Go 的实际退出重启；不代替双端原生桌面/Keychain 验收。
+
 ## 本地联调（无服务端）
 
 ```bash
@@ -198,7 +212,7 @@ DOING_SHOW_ON_LAUNCH=1 DOING_SKIP_LOGIN=1 pnpm tauri:dev
 ## 类型契约
 
 DTO 载荷由 Rust 单侧定义并生成：`cargo test -p doing-desktop --lib regenerate_types_gen -- --ignored`
-重新生成 `src/types.gen.ts`（ts-rs；u64/i64 → `number`，Option → `| null`，serde camelCase 透传）。
+重新生成 `src/types.gen.ts`（ts-rs；服务端 i64 版本跨 IPC 使用十进制 `string`，Option → `| null`，serde camelCase 透传；其他字段以生成物为准）。
 漂移守卫 `types_gen_is_up_to_date` 随常规测试运行，DTO 改动未重新生成即失败（已实测：手动破坏
 生成物 → 失败；重新生成 → 通过）。`src/types.ts` 仅再导出生成类型并保留展示常量（`SYNC_TEXT`）。
 事件名与命令清单仍为手写契约，由 `contract.test.ts` + `build.rs` 清单 + capability allow 列表

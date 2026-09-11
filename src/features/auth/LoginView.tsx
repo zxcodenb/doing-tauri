@@ -2,6 +2,7 @@
 
 import { useRef, useState } from 'react'
 import { api } from '../../lib/ipc'
+import { useDoing } from '../../hooks/useDoing'
 import { ActionButton, FieldBox, Notice } from '../../components/ui'
 import { Icon } from '../../components/icons'
 
@@ -12,12 +13,15 @@ function canSubmit(username: string, password: string, registering: boolean): bo
 }
 
 export function LoginView() {
+  const { auth } = useDoing()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [registering, setRegistering] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const passwordRef = useRef<HTMLInputElement>(null)
+
+  const displayError = error ?? auth?.error
 
   const submit = async () => {
     if (busy || !canSubmit(username, password, registering)) return
@@ -96,8 +100,8 @@ export function LoginView() {
           </label>
         </div>
 
-        {error ? (
-          <Notice message={error} isError />
+        {displayError ? (
+          <Notice message={displayError} isError />
         ) : null}
 
         <ActionButton

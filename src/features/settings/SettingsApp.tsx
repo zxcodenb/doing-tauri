@@ -6,7 +6,7 @@ import { api } from '../../lib/ipc'
 import { useDoing } from '../../hooks/useDoing'
 import { ActionButton, DoingMark, Notice, SurfaceCard, Wordmark } from '../../components/ui'
 import { Icon, type IconName } from '../../components/icons'
-import { SYNC_TEXT, type SettingsView } from '../../types'
+import { SYNC_TEXT, type NotificationPermissionView, type SettingsPatch } from '../../types'
 
 type SectionId = 'general' | 'reminders' | 'account' | 'data'
 
@@ -152,20 +152,19 @@ export function SettingsApp() {
   const { settings, sync, auth, snapshot, run } = useDoing()
   const [section, setSection] = useState<SectionId>('general')
   const [launchAtLogin, setLaunchAtLogin] = useState(false)
+  const [launchBusy, setLaunchBusy] = useState(false)
   const [launchMessage, setLaunchMessage] = useState<string | null>(null)
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [confirmReset, setConfirmReset] = useState(false)
   const [confirmLogout, setConfirmLogout] = useState(false)
   const [version, setVersion] = useState('')
-  const [notifGranted, setNotifGranted] = useState<boolean | null>(null)
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermissionView | null>(null)
+  const [permissionBusy, setPermissionBusy] = useState(false)
 
   useEffect(() => {
     void getVersion().then(setVersion)
-    void api.launchAtLoginGet().then(setLaunchAtLogin)
-    void import('@tauri-apps/plugin-notification')
-      .then((m) => m.isPermissionGranted())
-      .then(setNotifGranted)
-      .catch(() => {})
+    void api.launchAtLoginGet().then(setLaunchAtLogin).catch((error) => setLaunchMessage(error instanceof Error ? error.message : '无法读取系统登录项'))
+    void api.notificationPermission().then(setNotificationPermission).catch(() => setNotificationPermission({ status: 'unavailable', error: '无法查询系统通知状态' }))
   }, [])
 
   // 托盘入口（如“从云端恢复…”）要求定位到账户板块：窗口获得焦点时消费一次性请求。
@@ -188,7 +187,7 @@ export function SettingsApp() {
 
   if (!settings) return null
 
-  const patch = (p: Partial<SettingsView>) => {
+  const patch = (p: SettingsPatch) => {
     void run(() => api.settingsUpdate(p))
   }
 
@@ -198,9 +197,14 @@ export function SettingsApp() {
   const doneCount = snapshot.items.filter((i) => i.done).length
 
   const setLogin = async (v: boolean) => {
-    const message = await api.launchAtLoginSet(v)
-    setLaunchAtLogin(v)
-    setLaunchMessage(message || null)
+    if (launchBusy) return
+    setLaunchBusy(true)
+    try {
+      const message = await api.launchAtLoginSet(v)
+      setLaunchAtLogin(await api.launchAtLoginGet())
+      setLaunchMessage(message || null)
+    } catch (error) { setLaunchMessage(error instanceof Error ? error.message : '无法更新系统登录项') }
+    finally { setLaunchBusy(false) }
   }
 
   return (
@@ -259,6 +263,7 @@ export function SettingsApp() {
         </div>
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 26px 26px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+            {settings.error ? <Notice message={settings.error} isError /> : null}
             {section === 'general' ? (
               <>
                 <Group title="外观">
@@ -289,7 +294,7 @@ export function SettingsApp() {
                   </Row>
                   <div style={{ height: 1, background: 'var(--divider)' }} />
                   <Row title="登录 Mac 时启动" detail="开机后，让 Doing 在手边。">
-                    <Toggle checked={launchAtLogin} onChange={(v) => void setLogin(v)} />
+                    <Toggle checked={launchAtLogin} disabled={launchBusy} onChange={(v) => void setLogin(v)} />
                   </Row>
                   {launchMessage ? (
                     <>
@@ -407,18 +412,19 @@ export function SettingsApp() {
                 </Group>
                 <Group title="系统权限">
                   <Row
-                    title="macOS 通知权限"
+                    title="系统通知权限"
+                    detail={notificationPermission?.error ?? (notificationPermission?.status === 'denied' ? '请在系统通知设置中允许 Doing，之后点重新查询。' : '权限由操作系统管理，不从旧版本继承。')}
                     control={
-                      <span
-                        style={{
-                          fontSize: 12,
-                          fontWeight: 600,
-                          color:
-                            notifGranted === false ? 'var(--danger)' : 'var(--text-dim)',
-                        }}
-                      >
-                        {notifGranted === null ? '检查中…' : notifGranted ? '已允许' : '已拒绝'}
-                      </span>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end' }}>
+                        <span style={{ fontSize: 12, color: notificationPermission?.status === 'denied' ? 'var(--danger)' : 'var(--text-dim)' }}>
+                          {!notificationPermission ? '检查中…' : { granted: '已允许', denied: '已拒绝', notDetermined: '尚未请求', unavailable: '暂不可用' }[notificationPermission.status]}
+                        </span>
+                        <ActionButton disabled={permissionBusy} onClick={() => {
+                          setPermissionBusy(true)
+                          void run(async () => setNotificationPermission(await (notificationPermission?.status === 'notDetermined' ? api.notificationRequestPermission() : api.notificationPermission())))
+                            .finally(() => setPermissionBusy(false))
+                        }}>{permissionBusy ? '处理中…' : notificationPermission?.status === 'notDetermined' ? '申请通知权限' : '重新查询'}</ActionButton>
+                      </div>
                     }
                   />
                 </Group>

@@ -35,12 +35,9 @@ vi.mock('@tauri-apps/api/event', () => ({
   },
 }))
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: async () => '0.4.0' }))
+const windowState = vi.hoisted(() => ({ label: 'main' }))
 vi.mock('@tauri-apps/api/window', () => ({
-  getCurrentWindow: () => ({ label: 'main', onFocusChanged: async () => () => {} }),
-}))
-vi.mock('@tauri-apps/plugin-notification', () => ({
-  isPermissionGranted: async () => true,
-  onAction: async () => () => {},
+  getCurrentWindow: () => ({ label: windowState.label, onFocusChanged: async (handler: (event: { payload: unknown }) => void) => { eventBus.add('test://native-focus', handler); return () => eventBus.remove('test://native-focus', handler) } }),
 }))
 
 import { DoingProvider } from '../../hooks/useDoing'
@@ -48,17 +45,20 @@ import { Workspace } from '../../features/workspace/Workspace'
 import { InlineEditor } from '../../features/workspace/TaskRow'
 import { DuePicker } from '../../components/DuePicker'
 import { ConflictOverlay } from '../../features/workspace/ConflictOverlay'
+import { SyncBadge } from '../../features/workspace/SyncBadge'
 import { LoginView } from '../../features/auth/LoginView'
 import { SettingsApp } from '../../features/settings/SettingsApp'
 import { App } from '../../App'
 import type { StartupView } from '../../types'
+import { CANDIDATE_ID, startupFixture } from '../../test/fixtures'
 
 const ITEM_ID = '11111111-1111-1111-1111-111111111111'
 
 function startup(): StartupView {
   return {
-    auth: { loggedIn: true, username: 'tester', serverUrl: 'http://127.0.0.1:8080', isAuthenticating: false },
+    auth: { sessionGeneration: 1, eventRevision: 1, loggedIn: true, username: 'tester', serverUrl: 'http://127.0.0.1:8080', isAuthenticating: false, error: null },
     snapshot: {
+      sessionGeneration: 1, eventRevision: 1,
       revision: 1,
       items: [
         {
@@ -77,6 +77,7 @@ function startup(): StartupView {
       saveFailed: false,
     },
     settings: {
+      revision: 1, eventRevision: 1, error: null,
       appearance: 'system',
       mode: 'popover',
       showFocusInMenuBar: true,
@@ -89,7 +90,7 @@ function startup(): StartupView {
       showOverdueBanner: true,
       automaticSync: true,
     },
-    sync: { state: 'idle', lastSyncAt: null, lastError: null, conflictCloudCount: null, conflictCloudVersion: null },
+    sync: { sessionGeneration: 1, eventRevision: 1, conflictId: null, state: 'idle', lastSyncAt: null, lastError: null, conflictCloudCount: null, conflictCloudVersion: null },
     conflict: null,
     legacyImportAvailable: false,
     migration: null,
@@ -144,7 +145,11 @@ function installInvoke(overrides: Record<string, unknown> = {}) {
 afterEach(() => {
   cleanup()
   invokeMock.mockReset()
+  vi.restoreAllMocks()
+  vi.useRealTimers()
+  Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
   eventBus.clear()
+  windowState.label = 'main'
   try {
     localStorage.clear()
   } catch {
@@ -288,9 +293,10 @@ describe('冲突面板（必须先选择后确认；暂缓不覆盖）', () => {
         dueDate: null,
         updatedAt: '2026-09-10T00:00:00Z',
       }] },
-      sync: { ...s.sync, state: 'conflict', conflictCloudCount: 1, conflictCloudVersion: 9 },
+      sync: { ...s.sync, state: 'conflict', conflictCloudCount: 1, conflictCloudVersion: '9007199254740993', conflictId: CANDIDATE_ID },
       conflict: {
-        cloudVersion: 9,
+        sessionGeneration: 1, eventRevision: 1, candidateId: CANDIDATE_ID, reason: '本地与云端快照不同',
+        cloudVersion: '9007199254740993',
         cloudCount: 1,
         cloudPreview: [],
         updatedAt: null,
@@ -312,7 +318,21 @@ describe('冲突面板（必须先选择后确认；暂缓不覆盖）', () => {
     const useCloud = await screen.findByText('使用云端')
     expect(useCloud).not.toBeDisabled()
     await user.click(useCloud)
-    expect(invokeMock).toHaveBeenCalledWith('conflict_choose_cloud', { arg: { cloudVersion: 9 } })
+    expect(invokeMock).toHaveBeenCalledWith('conflict_choose_cloud', { arg: { candidateId: CANDIDATE_ID, cloudVersion: '9007199254740993' } })
+  })
+
+  it('候选 ID 变更后清除旧选择，即使版本字符串相同也必须重新确认', async () => {
+    installInvoke({ init_state: () => conflictStartup() })
+    const user = userEvent.setup()
+    render(<DoingProvider><ConflictOverlay /></DoingProvider>)
+    await user.click(await screen.findByText('云端的事项'))
+    const next = { ...conflictStartup().conflict!, eventRevision: 3, candidateId: 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb' }
+    act(() => eventBus.emit('doing://conflict', next))
+    expect(screen.getByText('选择后继续')).toBeDisabled()
+    expect(invokeMock).not.toHaveBeenCalledWith('conflict_choose_cloud', expect.anything())
+    await user.click(screen.getByText('云端的事项'))
+    await user.click(screen.getByText('使用云端'))
+    expect(invokeMock).toHaveBeenCalledWith('conflict_choose_cloud', { arg: { candidateId: next.candidateId, cloudVersion: '9007199254740993' } })
   })
 
   it('稍后决定走 defer（不提交覆盖）', async () => {
@@ -321,12 +341,18 @@ describe('冲突面板（必须先选择后确认；暂缓不覆盖）', () => {
     render(
       <DoingProvider>
         <ConflictOverlay />
+        <SyncBadge />
       </DoingProvider>,
     )
     await user.click(await screen.findByText('稍后决定'))
     expect(invokeMock).toHaveBeenCalledWith('conflict_defer')
     expect(invokeMock).not.toHaveBeenCalledWith('conflict_choose_local', expect.anything())
     expect(invokeMock).not.toHaveBeenCalledWith('conflict_choose_cloud', expect.anything())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await user.click(screen.getByTitle('查看同步详情'))
+    await user.click(screen.getByText('处理冲突'))
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+
   })
 })
 
@@ -630,6 +656,13 @@ describe('应用事件与系统集成（迁移横幅 / 打开设置 / 会话失�
         ...s,
         legacyImportAvailable: true,
         migration: {
+          eventRevision: 1,
+          transactionId: null,
+          recoveryRequired: false,
+          preferencesAvailable: false,
+          importedPreferences: false,
+          requiresLogin: true,
+          warnings: [],
           available: true,
           detectedFile: '/tmp/old/items.json',
           imported: false,
@@ -640,11 +673,30 @@ describe('应用事件与系统集成（迁移横幅 / 打开设置 / 会话失�
     })
     const user = userEvent.setup()
     render(<App />)
-    expect(await screen.findByText('检测到旧版 Doing 数据，是否导入此设备？导入前会自动备份，原文件不会被修改。')).toBeInTheDocument()
+    expect(await screen.findByText('检测到旧版 Doing 数据')).toBeInTheDocument()
     await user.click(screen.getByText('导入'))
+    expect(invokeMock).not.toHaveBeenCalledWith('migration_import', expect.anything())
+    await user.click(screen.getByRole('button', { name: '确认导入' }))
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith('migration_import', { source: '/tmp/old/items.json' })
+      expect(invokeMock).toHaveBeenCalledWith('migration_import', { source: '/tmp/old/items.json', preferences: false })
     })
+  })
+
+  it('主面板未显示时，设置窗口也保留待恢复迁移入口', async () => {
+    windowState.label = 'settings'
+    const initial = startup()
+    const id = '11111111-1111-4111-8111-111111111111'
+    installInvoke({ init_state: () => ({ ...initial, migration: {
+      eventRevision: 1, transactionId: id, available: false, detectedFile: '/fixture/items.json',
+      recoveryRequired: true, preferencesAvailable: false, importedPreferences: false, requiresLogin: true,
+      warnings: [], imported: false, error: '待核对来源', backupPath: '/fixture/backup.json',
+    } }) })
+    const user = userEvent.setup()
+    render(<App />)
+    expect(await screen.findByText('旧版导入尚未完成')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '继续恢复' }))
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('migration_resume', { transactionId: id }))
+    expect(invokeMock).not.toHaveBeenCalledWith('system_open_settings')
   })
 
   it('doing://open-settings 事件：写入一次性板块请求并打开设置窗口', async () => {
@@ -665,7 +717,7 @@ describe('应用事件与系统集成（迁移横幅 / 打开设置 / 会话失�
     render(<App />)
     await screen.findByLabelText('新事项')
     await act(async () => {
-      eventBus.emit('doing://session-lost', undefined)
+      eventBus.emit('doing://session-lost', { ...startupFixture(2, 10).auth, loggedIn: false, username: null, error: '登录状态已失效，请重新登录' })
     })
     expect(await screen.findByPlaceholderText('你的用户名')).toBeInTheDocument()
   })
@@ -752,5 +804,123 @@ describe('IME 组合输入守卫', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('task_edit', { id: SECOND_ID, arg: { text: '组合后文本' } })
     })
+  })
+})
+
+
+describe('账号会话与表单隔离', () => {
+  it('即使登出事件丢失，直接收到 B 登录也不会保留 A 的录入草稿', async () => {
+    installInvoke()
+    const user = userEvent.setup()
+    render(<App />)
+    await user.type(await screen.findByLabelText('新事项'), '不能跨账号提交的草稿')
+    act(() => {
+      eventBus.emit('doing://auth-state', { ...startupFixture(4, 20).auth, username: 'account-b' })
+      eventBus.emit('doing://snapshot', startupFixture(4, 21).snapshot)
+    })
+    expect(await screen.findByLabelText('新事项')).toHaveValue('')
+    act(() => eventBus.emit('doing://session-lost', { ...startupFixture(2, 19).auth, loggedIn: false }))
+    expect(screen.getByLabelText('新事项')).toBeInTheDocument()
+  })
+
+  it('系统安全存储/重启恢复的认证错误由登录界面展示', async () => {
+    const state = startup()
+    state.auth = { ...state.auth, loggedIn: false, error: '系统安全存储不可用，请检查权限' }
+    installInvoke({ init_state: state })
+    render(<App />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('系统安全存储不可用')
+  })
+})
+
+
+describe('原生焦点事件边界（jsdom 协议测试，不替代真实输入法验收）', () => {
+  it('固定浮窗失焦时不自动隐藏', async () => {
+    const state = startup(); state.settings.mode = 'panel'
+    installInvoke({ init_state: state })
+    render(<App />)
+    await screen.findByLabelText('新事项')
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+    vi.useFakeTimers()
+    act(() => eventBus.emit('test://native-focus', false))
+    await act(async () => vi.advanceTimersByTimeAsync(200))
+    expect(invokeMock).not.toHaveBeenCalledWith('system_hide_main')
+  })
+  it('composition 期间候选窗口夺焦不隐藏，结束后普通失焦才隐藏', async () => {
+    installInvoke(); render(<App />)
+    const input = await screen.findByLabelText('新事项')
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+    vi.useFakeTimers()
+    fireEvent.compositionStart(input)
+    act(() => eventBus.emit('test://native-focus', false))
+    await act(async () => vi.advanceTimersByTimeAsync(200))
+    expect(invokeMock).not.toHaveBeenCalledWith('system_hide_main')
+    fireEvent.compositionEnd(input)
+    act(() => eventBus.emit('test://native-focus', false))
+    await act(async () => vi.advanceTimersByTimeAsync(200))
+    expect(invokeMock).toHaveBeenCalledWith('system_hide_main')
+  })
+  it('延迟失焦检查前已重新获得焦点时不收起窗口', async () => {
+    installInvoke(); render(<App />)
+    await screen.findByLabelText('新事项')
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+    vi.useFakeTimers()
+    act(() => eventBus.emit('test://native-focus', false))
+    await act(async () => vi.advanceTimersByTimeAsync(50))
+    act(() => eventBus.emit('test://native-focus', true))
+    await act(async () => vi.advanceTimersByTimeAsync(200))
+    expect(invokeMock).not.toHaveBeenCalledWith('system_hide_main')
+  })
+})
+
+describe('持久通知定位与工作区 ACK', () => {
+  for (const [name, itemId] of [['焦点卡', ITEM_ID], ['折叠的已完成任务', DONE_ID], ['普通待办', SECOND_ID]]) {
+    it(`${name} 挂载并滚动后才确认通知消费`, async () => {
+      let pending = true
+      const id = '99999999-9999-4999-8999-999999999999'
+      const scroll = vi.spyOn(Element.prototype, 'scrollIntoView')
+      installInvoke({
+        init_state: () => navStartup(),
+        notification_next: () => pending ? { notificationId: id, itemId, sessionGeneration: 1, eventRevision: 2 } : null,
+        notification_ack: () => { expect(scroll).toHaveBeenCalled(); pending = false },
+      })
+      render(<App />)
+      await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('notification_ack', { notificationId: id, sessionGeneration: 1 }))
+      expect(invokeMock.mock.calls.filter(([command]) => command === 'notification_ack')).toHaveLength(1)
+      if (itemId === DONE_ID) expect(screen.getByText('已完成的事项')).toBeVisible()
+      scroll.mockRestore()
+    })
+  }
+  it('同 UUID 的旧账号读取结果不得滚动或被确认', async () => {
+    const id = '99999999-9999-4999-8999-999999999999'
+    installInvoke({ notification_next: () => ({ notificationId: id, itemId: ITEM_ID, sessionGeneration: 0, eventRevision: 100 }) })
+    render(<App />)
+    await screen.findByLabelText('新事项')
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('notification_next'))
+    expect(invokeMock).not.toHaveBeenCalledWith('notification_ack', expect.anything())
+  })
+})
+
+describe('真实通知权限状态的展示', () => {
+  it('未请求时明确申请权限，失败不伪显示为已允许', async () => {
+    installInvoke({ notification_permission: () => ({ status: 'notDetermined', error: null }), notification_request_permission: () => ({ status: 'denied', error: null }) })
+    const user = userEvent.setup()
+    render(<DoingProvider><SettingsApp /></DoingProvider>)
+    await user.click(await screen.findByText('提醒', { exact: true }))
+    expect(await screen.findByText('尚未请求')).toBeInTheDocument()
+    expect(invokeMock).not.toHaveBeenCalledWith('notification_request_permission')
+    await user.click(screen.getByRole('button', { name: '申请通知权限' }))
+    expect(await screen.findByText('已拒绝')).toBeInTheDocument()
+    expect(screen.getByText('请在系统通知设置中允许 Doing，之后点重新查询。')).toBeInTheDocument()
+    expect(screen.queryByText('已允许')).not.toBeInTheDocument()
+  })
+  it('原生查询不可用与已拒绝区分，不展示虚假的 Granted', async () => {
+    installInvoke({ notification_permission: () => ({ status: 'unavailable', error: '需要应用安装身份' }) })
+    const user = userEvent.setup()
+    render(<DoingProvider><SettingsApp /></DoingProvider>)
+    await user.click(await screen.findByText('提醒', { exact: true }))
+    expect(await screen.findByText('暂不可用')).toBeInTheDocument()
+    expect(screen.getByText('需要应用安装身份')).toBeInTheDocument()
+    expect(screen.queryByText('已拒绝')).not.toBeInTheDocument()
+    expect(screen.queryByText('已允许')).not.toBeInTheDocument()
   })
 })

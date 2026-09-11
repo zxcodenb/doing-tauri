@@ -82,7 +82,14 @@ impl SnapshotDto {
             .iter()
             .map(ItemDto::to_item)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((items, self.focus_id))
+        let mut ids = std::collections::HashSet::new();
+        if self.version < 0 || items.iter().any(|item| !ids.insert(item.id)) {
+            return Err("快照版本或任务标识无效".into());
+        }
+        let focus = self
+            .focus_id
+            .filter(|id| items.iter().any(|i| i.id == *id && !i.done));
+        Ok((items, focus))
     }
 }
 
@@ -101,7 +108,7 @@ pub struct SnapshotPutResponse {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthDto {
     pub access: String,
@@ -109,10 +116,23 @@ pub struct AuthDto {
     pub expires_in: i64,
 }
 
+impl std::fmt::Debug for AuthDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthDto")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
 /// 统一 API 错误：客户端只展示 message 或本地兜底文案。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
     Network,
+    SessionChanged,
+    CredentialsUnavailable,
+    InvalidConfiguration,
     InvalidResponse,
     Decoding,
     Unauthorized,
@@ -134,7 +154,10 @@ impl ApiError {
     }
 
     pub fn is_auth_failure(&self) -> bool {
-        matches!(self, ApiError::Unauthorized | ApiError::RefreshFailed)
+        matches!(
+            self,
+            ApiError::Unauthorized | ApiError::RefreshFailed | ApiError::CredentialsUnavailable
+        )
     }
 
     pub fn display_message(&self) -> &str {
@@ -142,12 +165,18 @@ impl ApiError {
             ApiError::Http { message, .. } => message,
             ApiError::Unauthorized | ApiError::RefreshFailed => "登录状态已失效，请重新登录",
             ApiError::Network => "无法连接服务器，请检查网络",
+            ApiError::SessionChanged => "会话已变化，请重新操作",
+            ApiError::CredentialsUnavailable => "系统安全存储不可用，请检查权限后重新登录",
+            ApiError::InvalidConfiguration => {
+                "服务地址配置无效；正式环境必须使用 HTTPS，且地址不能包含凭据或查询参数"
+            }
             ApiError::InvalidResponse | ApiError::Decoding => "服务器响应异常",
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiErrorBody {
     pub code: String,
     pub message: String,

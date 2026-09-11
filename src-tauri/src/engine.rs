@@ -1,1050 +1,1029 @@
-//! 快照同步引擎（语义对齐旧 SyncEngine + 计划 §4.3 不变量）。
-//! 约定：本模块所有公开函数接收 `&SyncShared`（Arc<AppState>）以便派生后台任务。
-//! 网络请求全部在锁外执行；状态更新在锁内短临界区完成；
-//! epoch 代次使旧任务失效；session 代次防护跨账号污染；push_lock 保证上传串行。
-
-use std::sync::Arc;
-use tokio::sync::watch;
-
+//! 单一快照同步协调器：同一网络流程串行，所有完成结果按会话与操作代次提交。
+//! 用户编辑仅取消旧防抖，不使正在返回的 GET 丢失仲裁，也不让旧 PUT 清掉新 dirty。
 use doing_core::clock::SystemClock;
+use doing_core::data::{AccountOwner, CloudData, ConflictReason, PendingConflict, UploadMarker};
 use doing_core::Clock;
+#[cfg(test)]
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tauri::Emitter;
+use uuid::Uuid;
 
+use crate::error::CommandError;
 use crate::events::*;
 use crate::net::client::ApiClient;
 use crate::net::dto::{ApiError, ItemDto, SnapshotDto, SnapshotPutRequest};
-use crate::state::{AppState, CoreInner};
-use tauri::Emitter;
+use crate::state::{AppState, AuthInner, ConflictCandidate, CoreInner, EngineInner, RetryAction};
 use crate::SyncShared;
 
 pub const DEBOUNCE_MS: u64 = 2000;
 pub const RETRY_BASE_MS: u64 = 2000;
-
-// 事件发射：未注入 AppHandle（单元测试）时静默跳过。
-pub fn try_emit<T: serde::Serialize + Clone>(st: &AppState, event: &str, payload: T) -> bool {
-    match st.app_handle.read() {
-        Ok(guard) => guard
-            .as_ref()
-            .map(|h| h.emit(event, payload.clone()).is_ok())
-            .unwrap_or(false),
-        Err(_) => false,
-    }
-}
-
+pub const SAVE_ERROR_MESSAGE: &str =
+    "本地保存失败：请检查磁盘空间、目录权限或数据文件版本；原有数据未被覆盖";
 fn now_str() -> String {
     SystemClock
         .now()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
-
-// MARK: - 事件发射
-
-pub async fn emit_sync_state(st: &SyncShared) {
-    let payload = {
-        let e = st.engine.read().await;
-        SyncStateViewPayload {
-            state: e.state,
-            last_sync_at: e.last_sync_at.clone(),
-            last_error: e.last_error.clone(),
-            conflict_cloud_count: e.conflict.as_ref().map(|c| c.items.len()),
-            conflict_cloud_version: e.conflict.as_ref().map(|c| c.version),
-        }
-    };
-    let _ = try_emit(st, EVT_SYNC_STATE, payload);
+pub fn try_emit<T: serde::Serialize + Clone>(st: &AppState, event: &str, payload: T) -> bool {
+    st.try_handle()
+        .is_some_and(|h| h.emit(event, payload).is_ok())
+}
+fn report_save_failure(st: &AppState) {
+    let _ = try_emit(st, EVT_SAVE_FAILED, SAVE_ERROR_MESSAGE);
 }
 
+#[derive(Clone)]
+struct SessionContext {
+    generation: u64,
+    id: Uuid,
+    owner: AccountOwner,
+    username: String,
+    client: ApiClient,
+}
+impl SessionContext {
+    fn matches(&self, e: &EngineInner, auth: &AuthInner) -> bool {
+        e.session_generation == self.generation
+            && auth.logged_in
+            && auth.client.as_ref().and_then(ApiClient::session_id) == Some(self.id)
+            && self.client.lease().is_some_and(|lease| lease.is_active())
+    }
+    fn live(&self, e: &EngineInner, auth: &AuthInner, operation: u64) -> bool {
+        self.matches(e, auth) && e.operation == operation
+    }
+}
+async fn context(st: &SyncShared) -> Option<SessionContext> {
+    let e = st.engine.read().await;
+    let auth = st.auth.lock().await;
+    let client = auth.client.as_ref()?;
+    let lease = client.lease()?;
+    if !auth.logged_in || !lease.is_active() {
+        return None;
+    }
+    Some(SessionContext {
+        generation: e.session_generation,
+        id: lease.id,
+        owner: lease.identity.owner.clone(),
+        username: lease.identity.username.clone(),
+        client: client.clone(),
+    })
+}
+fn candidate(pending: &PendingConflict) -> Option<ConflictCandidate> {
+    let data = pending.cloud.as_ref()?;
+    Some(ConflictCandidate {
+        id: pending.candidate_id,
+        owner: pending.owner.clone(),
+        reason: pending.reason,
+        snapshot: SnapshotDto {
+            items: data.items.iter().map(ItemDto::from).collect(),
+            focus_id: data.focus_id,
+            version: data.version,
+            updated_at: data.updated_at.clone(),
+        },
+    })
+}
+pub(crate) fn refresh_view(e: &mut EngineInner, core: &CoreInner, owner: Option<&AccountOwner>) {
+    e.dirty = core.meta.dirty;
+    e.known_version = owner
+        .filter(|o| core.meta.belongs_to(o))
+        .and(core.meta.known_server_version);
+    let pending = core
+        .meta
+        .pending_conflict
+        .as_ref()
+        .filter(|p| Some(&p.owner) == owner);
+    e.conflict = pending.and_then(candidate);
+    e.state = if pending.is_some() {
+        SyncStateView::Conflict
+    } else if core.save_failed {
+        SyncStateView::Failed
+    } else if owner.is_none() {
+        SyncStateView::Idle
+    } else if core.meta.dirty {
+        SyncStateView::Pending
+    } else if e.known_version.is_some() {
+        SyncStateView::Synced
+    } else {
+        SyncStateView::Idle
+    };
+}
+pub fn sync_view(e: &EngineInner, revision: u64) -> SyncStateViewPayload {
+    SyncStateViewPayload {
+        session_generation: e.session_generation,
+        event_revision: revision,
+        state: e.state,
+        last_sync_at: e.last_sync_at.clone(),
+        last_error: e.last_error.clone(),
+        conflict_cloud_count: e.conflict.as_ref().map(|c| c.items.len()),
+        conflict_cloud_version: e.conflict.as_ref().map(|c| c.version.to_string()),
+        conflict_id: e.conflict.as_ref().map(|c| c.id),
+    }
+}
+pub async fn emit_sync_state(st: &SyncShared) {
+    let e = st.engine.read().await;
+    let revision = st.next_event_revision();
+    let payload = sync_view(&e, revision);
+    let conflict = e
+        .conflict
+        .as_ref()
+        .map(|c| ConflictView::from(c, e.session_generation, revision));
+    drop(e);
+    let _ = try_emit(st, EVT_SYNC_STATE, payload);
+    if let Some(conflict) = conflict {
+        let _ = try_emit(st, EVT_CONFLICT, conflict);
+    }
+}
 pub async fn emit_snapshot(st: &SyncShared) {
+    let e = st.engine.read().await;
     let core = st.core.lock().await;
-    let payload = SnapshotView::from_store(&core.store, core.save_failed);
+    let payload = SnapshotView::from_store(
+        &core.store,
+        core.save_failed,
+        e.session_generation,
+        st.next_event_revision(),
+    );
     drop(core);
+    drop(e);
     let _ = try_emit(st, EVT_SNAPSHOT, payload);
 }
 
-// MARK: - 持久化
-
-/// 原子保存当前数据文件（任务与同步元数据同一提交边界）。
-/// 锁内短临界区构建快照，锁外执行文件写入；失败时更新 save_failed。
+pub(crate) fn commit_core(st: &AppState, current: &mut CoreInner, mut next: CoreInner) -> bool {
+    if current.migration.blocks_writes() {
+        return false;
+    }
+    if st.repo.save(&next.to_data_file()).is_ok() {
+        next.save_failed = false;
+        *current = next;
+        true
+    } else {
+        current.save_failed = true;
+        false
+    }
+}
 pub async fn persist_all(st: &SyncShared) -> bool {
-    let data = st.core.lock().await.to_data_file();
-    match st.repo.save(&data) {
-        Ok(()) => {
-            st.core.lock().await.save_failed = false;
-            true
-        }
-        Err(e) => {
-            eprintln!("[persist] 保存失败: {e}");
-            st.core.lock().await.save_failed = true;
-            let _ = try_emit(st, EVT_SAVE_FAILED, e.to_string());
-            false
-        }
+    let mut core = st.core.lock().await;
+    let saved = st.repo.save(&core.to_data_file()).is_ok();
+    core.save_failed = !saved;
+    drop(core);
+    if !saved {
+        report_save_failure(st);
     }
+    saved
 }
-
-/// 在锁内执行变更并立即原子落盘；返回 (变更结果, 是否成功保存)。
-pub async fn mutate_core<F, R>(st: &SyncShared, f: F) -> (R, bool)
+pub async fn save_now(st: &SyncShared) -> bool {
+    persist_all(st).await
+}
+pub async fn mutate_core<F, R>(
+    st: &SyncShared,
+    changes_tasks: bool,
+    f: F,
+) -> (Result<R, doing_core::CoreError>, bool)
 where
-    F: FnOnce(&mut CoreInner) -> R,
+    F: FnOnce(&mut CoreInner) -> Result<R, doing_core::CoreError>,
 {
-    let out = {
-        let mut core = st.core.lock().await;
-        f(&mut core)
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let owner = auth
+        .client
+        .as_ref()
+        .and_then(ApiClient::lease)
+        .filter(|lease| lease.is_active())
+        .map(|l| l.identity.owner.clone());
+    if changes_tasks && (!auth.logged_in || owner.is_none()) {
+        return (Err(doing_core::CoreError::AuthenticationRequired), true);
+    }
+    let mut core = st.core.lock().await;
+    let mut next = core.clone();
+    if changes_tasks
+        && core.store.is_empty()
+        && !core.meta.dirty
+        && core.meta.pending_conflict.is_none()
+        && core.meta.uncertain_upload.is_none()
+    {
+        let owner = owner.as_ref().unwrap();
+        if !next.meta.belongs_to(owner) {
+            next.meta
+                .claim(owner, auth.username.as_deref().unwrap_or_default());
+            next.meta.known_server_version = None;
+        }
+    }
+    let result = match f(&mut next) {
+        Ok(value) => value,
+        Err(error) => return (Err(error), true),
     };
-    let saved = persist_all(st).await;
-    (out, saved)
+    if changes_tasks {
+        next.meta.dirty = true;
+        next.meta.local_edit_revision = next.store.revision();
+    }
+    let saved = commit_core(st, &mut core, next);
+    if saved {
+        if changes_tasks {
+            e.bump_generation();
+        }
+        refresh_view(&mut e, &core, owner.as_ref());
+    }
+    drop(core);
+    drop(auth);
+    drop(e);
+    if !saved {
+        report_save_failure(st);
+    }
+    (Ok(result), saved)
 }
-
-// MARK: - 变更入口
-
-/// 本地变更入口（workspace 命令成功落盘后调用）：置 dirty → 自动同步防抖。
 pub async fn on_core_mutated(st: &SyncShared) {
-    {
-        let mut core = st.core.lock().await;
-        core.meta.dirty = true;
-    }
-    persist_all(st).await;
-    {
-        let mut e = st.engine.write().await;
-        e.dirty = true;
-        e.state = SyncStateView::Pending;
-    }
     emit_sync_state(st).await;
     maybe_auto_sync(st).await;
 }
 
-/// 手动同步（冲突态除外）。
-pub async fn flush(st: &SyncShared) {
-    if st.engine.read().await.state == SyncStateView::Conflict {
-        return;
-    }
-    schedule_push(st, 0).await;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Intent {
+    Automatic,
+    Manual,
+    Bootstrap,
+    Restore,
+    ConfirmLocal,
 }
-
-async fn maybe_auto_sync(st: &SyncShared) {
-    // 注意锁序：全局约定“先 auth 后 core”或分次取；此处分两次短锁，避免 core→auth 反转。
-    let auto = st.core.lock().await.settings.automatic_sync;
-    let logged_in = st.auth.lock().await.logged_in;
-    let e = st.engine.read().await;
-    let blocked = !logged_in
-        || !auto
-        || e.state == SyncStateView::Conflict
-        || e.state == SyncStateView::Syncing;
-    drop(e);
-    if blocked {
-        return;
+impl Intent {
+    fn can_upload(self, core: &CoreInner) -> bool {
+        matches!(self, Self::Manual | Self::ConfirmLocal)
+            || (self != Self::Restore && core.settings.automatic_sync)
     }
-    schedule_push(st, DEBOUNCE_MS).await;
+    fn retry(self) -> RetryAction {
+        if self == Self::Bootstrap {
+            RetryAction::Bootstrap
+        } else {
+            RetryAction::Sync
+        }
+    }
 }
-
-async fn schedule_push(st: &SyncShared, delay_ms: u64) {
-    let epoch = {
-        let mut e = st.engine.write().await;
-        e.bump_generation();
-        e.epoch
-    };
-    let st = Arc::clone(st);
-    let cancel_rx = st.engine.read().await.cancel_tx.subscribe();
+async fn invalidate_for_session(st: &SyncShared, ctx: &SessionContext) -> Result<(), CommandError> {
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    if !ctx.matches(&e, &auth) {
+        return Err(ApiError::SessionChanged.into());
+    }
+    e.invalidate();
+    Ok(())
+}
+pub async fn flush(st: &SyncShared) -> Result<(), CommandError> {
+    let ctx = context(st)
+        .await
+        .ok_or_else(CommandError::authentication_required)?;
+    // 手动请求不被之后的输入防抖取消，只受会话与串行网络流程约束。
+    invalidate_for_session(st, &ctx).await?;
+    let st = st.clone();
     tokio::spawn(async move {
-        let ok = wait_guarded(cancel_rx, epoch, std::time::Duration::from_millis(delay_ms)).await;
-        if ok {
-            push(&st, epoch).await;
+        let _ = run_flow(&st, ctx, Intent::Manual, None).await;
+    });
+    Ok(())
+}
+pub async fn auto_flush(st: &SyncShared) {
+    auto_flush_after(st, 0).await;
+}
+async fn maybe_auto_sync(st: &SyncShared) {
+    auto_flush_after(st, DEBOUNCE_MS).await;
+}
+async fn auto_flush_after(st: &SyncShared, delay_ms: u64) {
+    let Some(ctx) = context(st).await else {
+        return;
+    };
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    if !ctx.matches(&e, &auth) {
+        return;
+    }
+    let core = st.core.lock().await;
+    let ready_conflict = core
+        .meta
+        .pending_conflict
+        .as_ref()
+        .is_some_and(|p| p.owner == ctx.owner && p.cloud.is_some());
+    if !core.settings.automatic_sync || core.save_failed || ready_conflict || !core.meta.dirty {
+        return;
+    }
+    let retry_delay = e
+        .retry_at
+        .map(|at| at.saturating_duration_since(Instant::now()))
+        .unwrap_or_default();
+    let delay = Duration::from_millis(delay_ms).max(retry_delay);
+    let epoch = e.invalidate();
+    let cancel = e.cancel_tx.subscribe();
+    drop(core);
+    drop(auth);
+    drop(e);
+    let st = st.clone();
+    tokio::spawn(async move {
+        if wait_guarded(cancel, epoch, delay).await {
+            let _ = run_flow(&st, ctx, Intent::Automatic, Some(epoch)).await;
+        }
+    });
+}
+async fn wait_guarded(
+    mut cancel: tokio::sync::watch::Receiver<u64>,
+    epoch: u64,
+    delay: Duration,
+) -> bool {
+    if *cancel.borrow() != epoch {
+        return false;
+    }
+    tokio::time::timeout(delay, cancel.changed()).await.is_err()
+}
+pub async fn bootstrap(st: &SyncShared, generation: u64) {
+    let Some(ctx) = context(st).await else {
+        return;
+    };
+    if ctx.generation == generation {
+        let _ = run_flow(st, ctx, Intent::Bootstrap, None).await;
+    }
+}
+
+pub fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(
+        (RETRY_BASE_MS.saturating_mul(1_u64 << attempt.saturating_sub(1).min(6))).min(60_000),
+    )
+}
+pub async fn retry_tick(st: &SyncShared) {
+    let Some(ctx) = context(st).await else {
+        return;
+    };
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    if !ctx.matches(&e, &auth) {
+        return;
+    }
+    let core = st.core.lock().await;
+    if !core.settings.automatic_sync
+        || core.save_failed
+        || e.retry_at.is_none_or(|at| at > Instant::now())
+    {
+        return;
+    }
+    let intent = match e.retry_action {
+        Some(RetryAction::Bootstrap) => Intent::Bootstrap,
+        Some(RetryAction::Sync) => Intent::Automatic,
+        None => return,
+    };
+    e.retry_at = None;
+    let epoch = e.invalidate();
+    drop(core);
+    drop(auth);
+    drop(e);
+    let st = st.clone();
+    tokio::spawn(async move {
+        let _ = run_flow(&st, ctx, intent, Some(epoch)).await;
+    });
+}
+pub fn start_retry_driver(st: SyncShared) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            retry_tick(&st).await;
         }
     });
 }
 
-async fn wait_guarded(
-    mut cancel: watch::Receiver<u64>,
-    _epoch: u64,
-    duration: std::time::Duration,
-) -> bool {
-    // 超时返回 Err → 到期继续执行；changed 返回 Ok → 任务已被取代。
-    tokio::time::timeout(duration, cancel.changed())
-        .await
-        .map(|_| false)
-        .unwrap_or(true)
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    Restore,
+    Mark,
+    Upload,
+    Conflict(ConflictReason),
 }
-
-async fn is_stale(st: &SyncShared, epoch: u64) -> bool {
-    st.engine.read().await.epoch != epoch
+fn same_snapshot(core: &CoreInner, cloud: &SnapshotDto) -> bool {
+    let Ok((items, focus)) = cloud.to_local() else {
+        return false;
+    };
+    core.store.focus_id() == focus
+        && core.store.items().len() == items.len()
+        && core.store.items().iter().zip(items).all(|(a, b)| {
+            a.id == b.id
+                && a.text == b.text
+                && a.done == b.done
+                && a.created_at.timestamp_millis() == b.created_at.timestamp_millis()
+                && a.updated_at.timestamp_millis() == b.updated_at.timestamp_millis()
+                && a.due_date.map(|d| d.timestamp_millis())
+                    == b.due_date.map(|d| d.timestamp_millis())
+        })
 }
-
-/// 供 auth 等外部模块判断任务是否已被取代。
-pub async fn is_stale_public(st: &SyncShared, epoch: u64) -> bool {
-    is_stale(st, epoch).await
-}
-
-async fn client(st: &SyncShared) -> Option<ApiClient> {
-    st.auth.lock().await.client.clone()
-}
-
-// MARK: - 完整上传流程
-
-async fn push(st: &SyncShared, epoch: u64) {
-    // 串行化：等待在途上传完成后，本代仍有效则继续。
-    let push_lock = st.engine.read().await.push_lock.clone();
-    let _serial = push_lock.lock().await;
-    if is_stale(st, epoch).await {
-        return;
+fn decide(
+    core: &CoreInner,
+    ctx: &SessionContext,
+    cloud: &SnapshotDto,
+    revision_before_get: u64,
+    intent: Intent,
+) -> Decision {
+    if intent == Intent::Restore {
+        return if core.store.revision() == revision_before_get {
+            Decision::Restore
+        } else {
+            Decision::Conflict(ConflictReason::LocalChanged)
+        };
     }
-    let Some(client) = client(st).await else { return };
-    let session = st.engine.read().await.session_generation;
-    if st.engine.read().await.state == SyncStateView::Conflict {
-        return;
-    }
+    if let Some(pending) = core
+        .meta
+        .pending_conflict
+        .as_ref()
+        .filter(|p| p.owner == ctx.owner)
     {
-        let mut e = st.engine.write().await;
-        if e.epoch != epoch {
-            return;
+        return Decision::Conflict(pending.reason);
+    }
+    let empty = core.store.is_empty();
+    if !core.meta.belongs_to(&ctx.owner) {
+        return if empty && !core.meta.dirty {
+            Decision::Restore
+        } else {
+            Decision::Conflict(ConflictReason::Ownership)
+        };
+    }
+    if core.store.revision() != revision_before_get && !cloud.items.is_empty() {
+        return Decision::Conflict(ConflictReason::LocalChanged);
+    }
+    if let Some(base) = core.meta.known_server_version {
+        if cloud.version != base {
+            if empty && !core.meta.dirty {
+                return Decision::Restore;
+            }
+            return Decision::Conflict(if core.meta.uncertain_upload.is_some() {
+                ConflictReason::UploadUncertain
+            } else {
+                ConflictReason::RemoteChanged
+            });
         }
+        if core.meta.dirty {
+            Decision::Upload
+        } else if same_snapshot(core, cloud) {
+            Decision::Mark
+        } else {
+            Decision::Conflict(ConflictReason::Initial)
+        }
+    } else if empty && !core.meta.dirty {
+        Decision::Restore
+    } else if cloud.items.is_empty() {
+        Decision::Upload
+    } else {
+        Decision::Conflict(ConflictReason::Initial)
+    }
+}
+fn make_pending(
+    ctx: &SessionContext,
+    cloud: Option<CloudData>,
+    reason: ConflictReason,
+) -> PendingConflict {
+    PendingConflict {
+        candidate_id: Uuid::new_v4(),
+        owner: ctx.owner.clone(),
+        reason,
+        cloud,
+    }
+}
+fn cloud_data(cloud: &SnapshotDto) -> Result<CloudData, CommandError> {
+    let (items, focus_id) = cloud.to_local().map_err(|_| "服务器快照格式无效")?;
+    if cloud.version < 0 {
+        return Err("服务器快照版本无效".into());
+    }
+    Ok(CloudData {
+        items,
+        focus_id,
+        version: cloud.version,
+        updated_at: cloud.updated_at.clone(),
+    })
+}
+fn archive_if_foreign(
+    st: &SyncShared,
+    core: &CoreInner,
+    owner: &AccountOwner,
+) -> Result<(), CommandError> {
+    if (!core.store.is_empty() || core.meta.dirty)
+        && !core.meta.belongs_to(owner)
+        && st.repo.archive_current().is_err()
+    {
+        return Err(CommandError::persistence(
+            "原账号数据备份失败，未切换归属或替换事项",
+        ));
+    }
+    Ok(())
+}
+fn success(e: &mut EngineInner) {
+    e.retry_attempt = 0;
+    e.retry_at = None;
+    e.retry_action = None;
+    e.last_error = None;
+}
+
+async fn run_flow(
+    st: &SyncShared,
+    ctx: SessionContext,
+    intent: Intent,
+    epoch: Option<u64>,
+) -> Result<(), CommandError> {
+    let serial = st.engine.read().await.push_lock.clone();
+    let _serial = serial.lock().await;
+    let (operation, revision, get_first) = {
+        let mut e = st.engine.write().await;
+        let auth = st.auth.lock().await;
+        let core = st.core.lock().await;
+        if !ctx.matches(&e, &auth) || epoch.is_some_and(|v| v != e.epoch) {
+            return Ok(());
+        }
+        if core.save_failed {
+            return Err(CommandError::persistence(SAVE_ERROR_MESSAGE));
+        }
+        if intent == Intent::Automatic && !core.settings.automatic_sync {
+            return Ok(());
+        }
+        let pending = core
+            .meta
+            .pending_conflict
+            .as_ref()
+            .filter(|p| p.owner == ctx.owner);
+        if pending.is_some_and(|p| p.cloud.is_some()) && intent != Intent::Restore {
+            refresh_view(&mut e, &core, Some(&ctx.owner));
+            drop(core);
+            drop(auth);
+            drop(e);
+            emit_sync_state(st).await;
+            return Ok(());
+        }
+        e.operation += 1;
         e.state = SyncStateView::Syncing;
         e.last_error = None;
-    }
-    // 1) 无基线先 GET（绝不盲目 PUT）。
-    // 注意：读取锁必须先独立取值再 match——match 的 scrutinee 临时会把读锁
-    // 存活到整段分支（含内部 await 里的 engine.write），造成自死锁。
-    let known = st.engine.read().await.known_version;
-    let base = match known {
-        Some(v) => Some(v),
-        None => match client.get_snapshot().await {
-            Ok(snapshot) => {
-                if is_stale(st, epoch).await {
-                    return;
-                }
-                set_known_version(st, snapshot.version).await;
-                Some(snapshot.version)
-            }
-            Err(error) => {
-                handle_push_failure(st, epoch, error, RETRY_BASE_MS).await;
-                return;
-            }
-        },
+        e.retry_at = None;
+        let get_first = matches!(intent, Intent::Bootstrap | Intent::Restore)
+            || !core.meta.belongs_to(&ctx.owner)
+            || core.meta.known_server_version.is_none()
+            || core.meta.pending_conflict.is_some()
+            || core.meta.uncertain_upload.is_some()
+            || (intent == Intent::Manual && !core.meta.dirty);
+        (e.operation, core.store.revision(), get_first)
     };
-    let Some(base) = base else { return };
-    if is_stale(st, epoch).await {
-        return;
+    emit_sync_state(st).await;
+    if get_first {
+        let cloud = match ctx.client.get_snapshot().await {
+            Ok(cloud) => cloud,
+            Err(error) => {
+                if intent == Intent::Restore {
+                    mark_needs_candidate(st, &ctx, operation, ConflictReason::Restore).await;
+                }
+                fail(st, &ctx, operation, error.clone(), intent.retry()).await;
+                return Err(error.into());
+            }
+        };
+        let decision = {
+            let mut e = st.engine.write().await;
+            let auth = st.auth.lock().await;
+            let mut core = st.core.lock().await;
+            if !ctx.live(&e, &auth, operation) {
+                return Ok(());
+            }
+            let decision = decide(&core, &ctx, &cloud, revision, intent);
+            let mut next = core.clone();
+            match decision {
+                Decision::Conflict(reason) => {
+                    next.meta.pending_conflict =
+                        Some(make_pending(&ctx, Some(cloud_data(&cloud)?), reason));
+                    next.meta.uncertain_upload = None;
+                    // 保留最后确认基线，候选版本只在明确选择本地时才能用于 PUT。
+                }
+                Decision::Restore => {
+                    if let Err(message) = archive_if_foreign(st, &core, &ctx.owner) {
+                        e.state = SyncStateView::Failed;
+                        e.last_error = Some(message.message.clone());
+                        drop(core);
+                        drop(auth);
+                        drop(e);
+                        emit_sync_state(st).await;
+                        return Err(message);
+                    }
+                    let data = cloud_data(&cloud)?;
+                    next.store.replace_all(data.items, data.focus_id);
+                    next.meta.claim(&ctx.owner, &ctx.username);
+                    next.meta.known_server_version = Some(cloud.version);
+                    next.meta.dirty = false;
+                    next.meta.pending_conflict = None;
+                    next.meta.uncertain_upload = None;
+                }
+                Decision::Mark => {
+                    next.meta.known_server_version = Some(cloud.version);
+                    next.meta.uncertain_upload = None;
+                }
+                Decision::Upload => {
+                    next.meta.known_server_version = Some(cloud.version);
+                    next.meta.dirty = true;
+                    next.meta.uncertain_upload = None;
+                }
+            }
+            let saved = commit_core(st, &mut core, next);
+            refresh_view(&mut e, &core, Some(&ctx.owner));
+            if !saved {
+                e.last_error = Some(SAVE_ERROR_MESSAGE.into());
+                drop(core);
+                drop(auth);
+                drop(e);
+                report_save_failure(st);
+                emit_sync_state(st).await;
+                return Err(CommandError::persistence(SAVE_ERROR_MESSAGE));
+            }
+            if decision != Decision::Upload {
+                success(&mut e);
+            }
+            if matches!(decision, Decision::Mark | Decision::Restore) {
+                e.last_sync_at = Some(now_str());
+            }
+            decision
+        };
+        emit_snapshot(st).await;
+        emit_sync_state(st).await;
+        if decision != Decision::Upload {
+            return Ok(());
+        }
     }
+    upload(st, &ctx, operation, intent).await
+}
 
-    // 2) 锁内抓取本地快照，锁外执行 PUT。
-    let request = {
-        let core = st.core.lock().await;
-        SnapshotPutRequest {
+async fn upload(
+    st: &SyncShared,
+    ctx: &SessionContext,
+    operation: u64,
+    intent: Intent,
+) -> Result<(), CommandError> {
+    let (request, marker) = {
+        let mut e = st.engine.write().await;
+        let auth = st.auth.lock().await;
+        let mut core = st.core.lock().await;
+        if !ctx.live(&e, &auth, operation) {
+            return Ok(());
+        }
+        if !core.meta.belongs_to(&ctx.owner)
+            || core.meta.pending_conflict.is_some()
+            || core.meta.uncertain_upload.is_some()
+        {
+            return Err("同步基线或数据归属尚未确认".into());
+        }
+        if core.save_failed {
+            return Err(CommandError::persistence(SAVE_ERROR_MESSAGE));
+        }
+        if !intent.can_upload(&core) || !core.meta.dirty {
+            refresh_view(&mut e, &core, Some(&ctx.owner));
+            drop(core);
+            drop(auth);
+            drop(e);
+            emit_sync_state(st).await;
+            return Ok(());
+        }
+        let base = core
+            .meta
+            .known_server_version
+            .ok_or("尚未取得云端版本基线")?;
+        let request = SnapshotPutRequest {
             items: core.store.items().iter().map(ItemDto::from).collect(),
             focus_id: core.store.focus_id(),
             base_version: base,
-        }
-    };
-    let result = client.put_snapshot(&request).await;
-
-    // 会话已切换：旧结果一律丢弃（版本也不采纳）。
-    if st.engine.read().await.session_generation != session {
-        return;
-    }
-    if is_stale(st, epoch).await {
-        // 版本是服务端客观事实，仍采纳；状态推进由新代处理。
-        if let Ok(response) = &result {
-            set_known_version(st, response.version).await;
-        }
-        return;
-    }
-    match result {
-        Ok(response) => {
-            mark_synced(st, response.version).await;
-        }
-        Err(error) => {
-            handle_push_failure(st, epoch, error, RETRY_BASE_MS).await;
-        }
-    }
-}
-
-// MARK: - 状态推进
-
-pub async fn set_known_version(st: &SyncShared, version: i64) {
-    st.core.lock().await.meta.known_server_version = Some(version);
-    persist_all(st).await;
-    st.engine.write().await.known_version = Some(version);
-}
-
-pub async fn mark_synced(st: &SyncShared, version: i64) {
-    {
-        let mut core = st.core.lock().await;
-        core.meta.known_server_version = Some(version);
-        core.meta.dirty = false;
-    }
-    persist_all(st).await;
-    {
-        let mut e = st.engine.write().await;
-        e.known_version = Some(version);
-        e.dirty = false;
-        e.state = SyncStateView::Synced;
-        e.last_sync_at = Some(now_str());
-        e.last_error = None;
-    }
-    emit_sync_state(st).await;
-}
-
-// MARK: - 失败处置
-
-/// 失败处置：登录失效走登出；409 拉最新云端转冲突；其余置 failed，
-/// 由全局 retry_driver 周期重试（不在此处 spawn 递归，避免栈式任务堆积）。
-async fn handle_push_failure(st: &SyncShared, _epoch: u64, error: ApiError, _retry_delay_ms: u64) {
-    if error.is_auth_failure() {
-        handle_auth_lost(st).await;
-    } else if error.is_conflict() {
-        resolve_conflict(st).await;
-    } else {
-        let mut e = st.engine.write().await;
-        e.state = SyncStateView::Failed;
-        e.last_error = Some(error.display_message().to_string());
-        drop(e);
-        emit_sync_state(st).await;
-    }
-}
-
-/// 409 处置：拉取最新云端进入冲突流程（拉取失败则置 failed 等驱动重试）。
-async fn resolve_conflict(st: &SyncShared) {
-    let Some(client) = client(st).await else { return };
-    match client.get_snapshot().await {
-        Ok(cloud) => {
-            prepare_conflict(st, cloud).await;
-        }
-        Err(error) => {
-            if error.is_auth_failure() {
-                handle_auth_lost(st).await;
-                return;
-            }
-            let mut e = st.engine.write().await;
+        };
+        let marker = UploadMarker {
+            id: Uuid::new_v4(),
+            owner: ctx.owner.clone(),
+            base_version: base,
+            revision: core.store.revision(),
+        };
+        let mut next = core.clone();
+        next.meta.uncertain_upload = Some(marker.clone());
+        if !commit_core(st, &mut core, next) {
             e.state = SyncStateView::Failed;
-            e.last_error = Some(error.display_message().to_string());
+            e.last_error = Some(SAVE_ERROR_MESSAGE.into());
+            drop(core);
+            drop(auth);
             drop(e);
+            report_save_failure(st);
             emit_sync_state(st).await;
+            return Err(CommandError::persistence(SAVE_ERROR_MESSAGE));
+        }
+        e.state = SyncStateView::Syncing;
+        (request, marker)
+    };
+    match ctx.client.put_snapshot(&request).await {
+        Ok(response) => acknowledge(st, ctx, operation, &marker, response.version).await,
+        Err(error) if error.is_conflict() => {
+            if mark_needs_candidate(st, ctx, operation, ConflictReason::RemoteChanged).await {
+                match ctx.client.get_snapshot().await {
+                    Ok(cloud) => {
+                        store_candidate(st, ctx, operation, cloud, ConflictReason::RemoteChanged)
+                            .await?;
+                    }
+                    Err(error) => {
+                        fail(st, ctx, operation, error.clone(), RetryAction::Sync).await;
+                        return Err(error.into());
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(error) => {
+            fail(st, ctx, operation, error.clone(), RetryAction::Sync).await;
+            Err(error.into())
         }
     }
 }
-
-/// 全局重试驱动：failed + dirty 且有会话时周期重新上传（指数退避上限 60s）。
-pub async fn retry_tick(st: &SyncShared) {
-    let should = {
-        let e = st.engine.read().await;
-        e.state == SyncStateView::Failed && e.dirty
-    };
-    if !should {
-        return;
-    }
-    let logged_in = st.auth.lock().await.logged_in;
-    if logged_in {
-        schedule_push(st, 0).await;
-    }
-}
-
-/// 失败后的等待间隔：交给 retry_driver 固定周期触发，无需此处调度。
-pub fn start_retry_driver(state: SyncShared) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            retry_tick(&state).await;
-        }
-    });
-}
-
-// MARK: - 冲突
-
-/// 冲突/仲裁的公共挂起态：保留候选、采纳其版本、停止自动上传。
-pub async fn prepare_conflict(st: &SyncShared, cloud: SnapshotDto) {
+async fn acknowledge(
+    st: &SyncShared,
+    ctx: &SessionContext,
+    operation: u64,
+    marker: &UploadMarker,
+    version: i64,
+) -> Result<(), CommandError> {
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let mut core = st.core.lock().await;
+    if !ctx.live(&e, &auth, operation)
+        || !core.meta.belongs_to(&ctx.owner)
+        || core.meta.uncertain_upload.as_ref().map(|m| m.id) != Some(marker.id)
     {
-        let mut e = st.engine.write().await;
-        e.bump_generation();
-        e.known_version = Some(cloud.version);
-        e.conflict = Some(cloud.clone());
-        e.last_error = Some("本地与云端都有事项，请选择保留的版本。".into());
-        e.state = SyncStateView::Conflict;
+        return Ok(());
     }
-    st.core.lock().await.meta.known_server_version = Some(cloud.version);
-    persist_all(st).await;
-    emit_sync_state(st).await;
-    let _ = try_emit(st, EVT_CONFLICT, ConflictView::from(&cloud));
-}
-
-/// 选择“本地”：以云端最新版本为基线上传本地。
-pub async fn choose_local(st: &SyncShared) {
-    {
-        let mut e = st.engine.write().await;
-        e.conflict = None;
-        e.state = SyncStateView::Idle;
+    let mut next = core.clone();
+    next.meta.known_server_version = Some(version);
+    next.meta.uncertain_upload = None;
+    if core.meta.local_edit_revision <= marker.revision {
+        next.meta.dirty = false;
     }
-    emit_sync_state(st).await;
-    flush(st).await;
-}
-
-/// 选择“云端”：本地与基线都采用云端快照。
-pub async fn choose_cloud(st: &SyncShared, cloud: &SnapshotDto) {
-    let Some((items, focus)) = cloud.to_local().ok() else {
-        return;
-    };
-    {
-        let mut core = st.core.lock().await;
-        core.store.replace_all(items, focus);
-        core.meta.known_server_version = Some(cloud.version);
-        core.meta.dirty = false;
-    }
-    persist_all(st).await;
-    {
-        let mut e = st.engine.write().await;
-        e.conflict = None;
-        e.known_version = Some(cloud.version);
-        e.dirty = false;
-        e.state = SyncStateView::Synced;
+    let saved = commit_core(st, &mut core, next);
+    refresh_view(&mut e, &core, Some(&ctx.owner));
+    if saved {
+        success(&mut e);
         e.last_sync_at = Some(now_str());
-        e.last_error = None;
+    } else {
+        e.last_error = Some(SAVE_ERROR_MESSAGE.into());
     }
+    drop(core);
+    drop(auth);
+    drop(e);
+    if !saved {
+        report_save_failure(st);
+    }
+    emit_sync_state(st).await;
+    if saved {
+        Ok(())
+    } else {
+        Err(CommandError::persistence(SAVE_ERROR_MESSAGE))
+    }
+}
+async fn mark_needs_candidate(
+    st: &SyncShared,
+    ctx: &SessionContext,
+    operation: u64,
+    reason: ConflictReason,
+) -> bool {
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let mut core = st.core.lock().await;
+    if !ctx.live(&e, &auth, operation) {
+        return false;
+    }
+    let mut next = core.clone();
+    next.meta.pending_conflict = Some(make_pending(ctx, None, reason));
+    next.meta.uncertain_upload = None;
+    let saved = commit_core(st, &mut core, next);
+    refresh_view(&mut e, &core, Some(&ctx.owner));
+    if !saved {
+        e.last_error = Some(SAVE_ERROR_MESSAGE.into());
+    }
+    drop(core);
+    drop(auth);
+    drop(e);
+    if !saved {
+        report_save_failure(st);
+    }
+    emit_sync_state(st).await;
+    saved
+}
+async fn store_candidate(
+    st: &SyncShared,
+    ctx: &SessionContext,
+    operation: u64,
+    cloud: SnapshotDto,
+    reason: ConflictReason,
+) -> Result<(), CommandError> {
+    let data = cloud_data(&cloud)?;
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let mut core = st.core.lock().await;
+    if !ctx.live(&e, &auth, operation) {
+        return Ok(());
+    }
+    let mut next = core.clone();
+    next.meta.pending_conflict = Some(make_pending(ctx, Some(data), reason));
+    next.meta.uncertain_upload = None;
+    let saved = commit_core(st, &mut core, next);
+    refresh_view(&mut e, &core, Some(&ctx.owner));
+    if saved {
+        success(&mut e);
+    } else {
+        e.last_error = Some(SAVE_ERROR_MESSAGE.into());
+    }
+    drop(core);
+    drop(auth);
+    drop(e);
+    if !saved {
+        report_save_failure(st);
+    }
+    emit_sync_state(st).await;
+    if saved {
+        Ok(())
+    } else {
+        Err(CommandError::persistence(SAVE_ERROR_MESSAGE))
+    }
+}
+async fn fail(
+    st: &SyncShared,
+    ctx: &SessionContext,
+    operation: u64,
+    error: ApiError,
+    retry: RetryAction,
+) {
+    if error == ApiError::SessionChanged {
+        return;
+    }
+    if error.is_auth_failure() {
+        crate::auth::lose_session(st, ctx.generation, ctx.id, &error).await;
+        return;
+    }
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let core = st.core.lock().await;
+    if !ctx.live(&e, &auth, operation) {
+        return;
+    }
+    e.state = if core
+        .meta
+        .pending_conflict
+        .as_ref()
+        .is_some_and(|p| p.owner == ctx.owner)
+    {
+        SyncStateView::Conflict
+    } else {
+        SyncStateView::Failed
+    };
+    e.last_error = Some(error.display_message().to_owned());
+    e.retry_attempt = e.retry_attempt.saturating_add(1);
+    e.retry_at = Some(Instant::now() + retry_delay(e.retry_attempt));
+    e.retry_action = Some(retry);
+    drop(core);
+    drop(auth);
+    drop(e);
+    emit_sync_state(st).await;
+}
+
+pub async fn restore_from_cloud(st: &SyncShared) -> Result<(), CommandError> {
+    let ctx = context(st)
+        .await
+        .ok_or_else(CommandError::authentication_required)?;
+    invalidate_for_session(st, &ctx).await?;
+    run_flow(st, ctx, Intent::Restore, None).await
+}
+fn verify_choice<'a>(
+    core: &'a CoreInner,
+    ctx: &SessionContext,
+    id: Uuid,
+    version: i64,
+) -> Result<&'a CloudData, CommandError> {
+    let pending = core
+        .meta
+        .pending_conflict
+        .as_ref()
+        .ok_or("没有待处理的冲突")?;
+    if pending.owner != ctx.owner || pending.candidate_id != id {
+        return Err(CommandError::new(
+            "conflictChanged",
+            "冲突候选或账号已变化，请重新查看后确认",
+            false,
+        ));
+    }
+    let cloud = pending
+        .cloud
+        .as_ref()
+        .ok_or("尚未取得云端候选，请重试同步")?;
+    if cloud.version != version {
+        return Err(CommandError::new(
+            "conflictChanged",
+            "云端候选版本已变化，请重新确认",
+            false,
+        ));
+    }
+    Ok(cloud)
+}
+pub async fn choose_local(st: &SyncShared, id: Uuid, version: i64) -> Result<(), CommandError> {
+    let ctx = context(st)
+        .await
+        .ok_or_else(CommandError::authentication_required)?;
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let mut core = st.core.lock().await;
+    if !ctx.matches(&e, &auth) {
+        return Err(ApiError::SessionChanged.into());
+    }
+    verify_choice(&core, &ctx, id, version)?;
+    archive_if_foreign(st, &core, &ctx.owner)?;
+    let mut next = core.clone();
+    next.meta.claim(&ctx.owner, &ctx.username);
+    next.meta.known_server_version = Some(version);
+    next.meta.dirty = true;
+    next.meta.pending_conflict = None;
+    next.meta.uncertain_upload = None;
+    if !commit_core(st, &mut core, next) {
+        drop(core);
+        drop(auth);
+        drop(e);
+        report_save_failure(st);
+        return Err(CommandError::persistence(SAVE_ERROR_MESSAGE));
+    }
+    e.operation += 1;
+    e.invalidate();
+    success(&mut e);
+    refresh_view(&mut e, &core, Some(&ctx.owner));
+    drop(core);
+    drop(auth);
+    drop(e);
+    emit_sync_state(st).await;
+    let st = st.clone();
+    tokio::spawn(async move {
+        let _ = run_flow(&st, ctx, Intent::ConfirmLocal, None).await;
+    });
+    Ok(())
+}
+pub async fn choose_cloud(st: &SyncShared, id: Uuid, version: i64) -> Result<(), CommandError> {
+    let ctx = context(st)
+        .await
+        .ok_or_else(CommandError::authentication_required)?;
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let mut core = st.core.lock().await;
+    if !ctx.matches(&e, &auth) {
+        return Err(ApiError::SessionChanged.into());
+    }
+    let cloud = verify_choice(&core, &ctx, id, version)?.clone();
+    archive_if_foreign(st, &core, &ctx.owner)?;
+    let mut next = core.clone();
+    next.store.replace_all(cloud.items, cloud.focus_id);
+    next.meta.claim(&ctx.owner, &ctx.username);
+    next.meta.known_server_version = Some(version);
+    next.meta.dirty = false;
+    next.meta.pending_conflict = None;
+    next.meta.uncertain_upload = None;
+    if !commit_core(st, &mut core, next) {
+        drop(core);
+        drop(auth);
+        drop(e);
+        report_save_failure(st);
+        return Err(CommandError::persistence(SAVE_ERROR_MESSAGE));
+    }
+    e.operation += 1;
+    e.invalidate();
+    success(&mut e);
+    refresh_view(&mut e, &core, Some(&ctx.owner));
+    e.last_sync_at = Some(now_str());
+    drop(core);
+    drop(auth);
+    drop(e);
     emit_snapshot(st).await;
     emit_sync_state(st).await;
     crate::reminder::refresh(st).await;
+    Ok(())
 }
-
-/// 从云端恢复（用户显式触发）：恢复期间本地变化则转入冲突，不覆盖新工作。
-pub async fn restore_from_cloud(st: &SyncShared) {
-    let Some(client) = client(st).await else { return };
-    let epoch = {
-        let mut e = st.engine.write().await;
-        if e.state == SyncStateView::Syncing {
-            return;
-        }
-        e.bump_generation();
-        e.epoch
-    };
+pub async fn defer_conflict(st: &SyncShared) -> Result<(), CommandError> {
+    let ctx = context(st)
+        .await
+        .ok_or_else(CommandError::authentication_required)?;
+    let mut e = st.engine.write().await;
+    let auth = st.auth.lock().await;
+    let core = st.core.lock().await;
+    if !ctx.matches(&e, &auth)
+        || !core
+            .meta
+            .pending_conflict
+            .as_ref()
+            .is_some_and(|p| p.owner == ctx.owner)
     {
-        let mut e = st.engine.write().await;
-        e.state = SyncStateView::Syncing;
-        e.last_error = None;
+        return Err("没有待处理的冲突".into());
     }
+    refresh_view(&mut e, &core, Some(&ctx.owner));
+    drop(core);
+    drop(auth);
+    drop(e);
     emit_sync_state(st).await;
-    let (original_items, original_focus) = {
-        let core = st.core.lock().await;
-        (core.store.items().to_vec(), core.store.focus_id())
-    };
-    match client.get_snapshot().await {
-        Ok(cloud) => {
-            if is_stale(st, epoch).await {
-                return;
-            }
-            let changed = {
-                let core = st.core.lock().await;
-                core.store.items() != original_items || core.store.focus_id() != original_focus
-            };
-            if changed {
-                prepare_conflict(st, cloud).await;
-                return;
-            }
-            choose_cloud(st, &cloud).await;
-        }
-        Err(error) => {
-            if is_stale(st, epoch).await {
-                return;
-            }
-            if error.is_auth_failure() {
-                handle_auth_lost(st).await;
-            } else {
-                let mut e = st.engine.write().await;
-                e.state = SyncStateView::Failed;
-                e.last_error = Some(error.display_message().to_string());
-            }
-            emit_sync_state(st).await;
-        }
-    }
+    Ok(())
 }
-
-// MARK: - 会话生命周期
-
-pub async fn handle_auth_lost(st: &SyncShared) {
-    session_reset(st).await;
-    {
-        let mut e = st.engine.write().await;
-        e.state = SyncStateView::Unauthorized;
-        e.last_error = Some(ApiError::Unauthorized.display_message().to_string());
-    }
-    emit_sync_state(st).await;
-    let _ = try_emit(st, EVT_SESSION_LOST, ());
-}
-
-/// 登出/鉴权丢失：清空引擎会话态与凭据；本地事项保留、历史清除。
-pub async fn session_reset(st: &SyncShared) {
-    {
-        let mut e = st.engine.write().await;
-        e.bump_session();
-    }
-    {
-        let mut auth = st.auth.lock().await;
-        auth.logged_in = false;
-        auth.is_authenticating = false;
-        auth.client = None;
-        auth.username = None;
-        auth.server_url = None;
-        auth.creds.clear();
-    }
-    {
-        let mut core = st.core.lock().await;
-        core.store.clear_history();
-        core.meta.known_server_version = None;
-        core.meta.dirty = false;
-    }
-    persist_all(st).await;
-    emit_snapshot(st).await;
-    emit_sync_state(st).await;
-}
-
-/// 登录成功后把会话内变更者身份写入 meta（owner 供归属判断）。
-pub async fn claim_owner_public(st: &SyncShared) {
-    let (server_url, username) = {
-        let auth = st.auth.lock().await;
-        (auth.server_url.clone(), auth.username.clone())
-    };
-    if let (Some(server_url), Some(username)) = (server_url, username) {
-        let mut core = st.core.lock().await;
-        core.meta.server_url = Some(server_url);
-        core.meta.username = Some(username);
-        drop(core);
-        persist_all(st).await;
-    }
-}
-
-/// 供 commands 单条落盘用：任何变更后的统一保存。
-pub async fn save_now(st: &SyncShared) -> bool {
-    persist_all(st).await
-}
-
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::creds::CredentialStore;
-    use crate::net::dto::AuthDto;
-    use crate::net::test_server::{json_response, put_ok, snapshot, Resp, Scripted, SNAPSHOT_EMPTY};
-    use std::future::Future;
-    use std::time::Duration;
-
-    async fn state_of(st: &AppState) -> SyncStateView {
-        st.engine.read().await.state
-    }
-    async fn known_of(st: &AppState) -> Option<i64> {
-        st.engine.read().await.known_version
-    }
-
-    async fn wait_until<F, Fut>(mut pred: F) -> bool
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = bool>,
-    {
-        for _ in 0..500 {
-            if pred().await {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        pred().await
-    }
-
-    fn temp_state() -> (Arc<AppState>, Arc<crate::creds::memory::MemoryStore>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let creds = Arc::new(crate::creds::memory::MemoryStore::default());
-        let st = Arc::new(crate::state::AppState::new(
-            dir.path().to_path_buf(),
-            None,
-            creds.clone() as Arc<dyn CredentialStore>,
-        ));
-        (st, creds, dir)
-    }
-
-    fn seed_tokens(creds: &Arc<crate::creds::memory::MemoryStore>) {
-        creds
-            .save(&AuthDto {
-                access: "access-token".into(),
-                refresh: "refresh-token".into(),
-                expires_in: 900,
-            })
-            .unwrap();
-    }
-
-    async fn seed_item(st: &AppState, text: &str) {
-        let mut core = st.core.lock().await;
-        core.store.add(text, None, SystemClock.now()).unwrap();
-    }
-
-    async fn login_like(st: &AppState, url: &str, creds: Arc<crate::creds::memory::MemoryStore>) {
-        let mut auth = st.auth.lock().await;
-        auth.client = Some(ApiClient::new(url.to_string(), creds));
-        auth.logged_in = true;
-        auth.username = Some("tester".into());
-        auth.server_url = Some(url.to_string());
-        drop(auth);
-        st.engine.write().await.bump_session();
-    }
-
-    #[tokio::test]
-    async fn no_baseline_gets_then_puts_with_base0() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|req| {
-            if req.method == "GET" {
-                json_response(200, SNAPSHOT_EMPTY)
-            } else if req.method == "PUT" {
-                json_response(200, &put_ok(1))
-            } else {
-                json_response(404, r#"{"code":"not_found","message":"no"}"#)
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "本地事项").await;
-
-        flush(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Synced }).await,
-            "未进入 synced"
-        );
-        let reqs = server.requests();
-        assert_eq!(reqs.iter().filter(|r| r.method == "GET").count(), 1);
-        let puts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT").collect();
-        assert_eq!(puts.len(), 1);
-        assert!(puts[0].body.contains("\"baseVersion\":0"), "{}", puts[0].body);
-        assert!(puts[0].body.contains("本地事项"));
-        assert_eq!(
-            puts[0].bearer.as_deref(),
-            Some("access-token"),
-            "业务请求必须携带访问令牌"
-        );
-        assert_eq!(known_of(&st).await, Some(1));
-        let core = st.core.lock().await;
-        assert!(!core.meta.dirty);
-        assert_eq!(core.meta.known_server_version, Some(1));
-    }
-
-    #[tokio::test]
-    async fn put_409_enters_conflict_blocks_auto_then_choose_local_uses_latest_base() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|req| {
-            if req.method == "GET" {
-                json_response(
-                    200,
-                    &snapshot(
-                        r#"[{"id":"33333333-3333-3333-3333-333333333333","text":"cloud","done":false,"createdAt":"2026-09-08T00:00:00Z","dueDate":null,"updatedAt":"2026-09-08T00:00:00Z"}]"#,
-                        2,
-                        None,
-                    ),
-                )
-            } else {
-                json_response(
-                    409,
-                    r#"{"code":"snapshot_conflict","message":"snapshot changed on another device","currentVersion":2}"#,
-                )
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "本地").await;
-
-        flush(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Conflict }).await,
-            "应进入冲突态"
-        );
-        assert_eq!(known_of(&st).await, Some(2));
-        {
-            let e = st.engine.read().await;
-            assert!(e.conflict.is_some());
-            assert_eq!(e.conflict.as_ref().unwrap().version, 2);
-        }
-
-        // 冲突未决时自动上传被阻断：本地再改也不会新增 PUT。
-        let puts_before = server.requests_matching(|r| r.method == "PUT");
-        assert_eq!(puts_before, 1, "首次上传应已发生（409）");
-        seed_item(&st, "冲突期间的本地记录").await;
-        on_core_mutated(&st).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(
-            server.requests_matching(|r| r.method == "PUT"),
-            puts_before,
-            "冲突未决不得自动上传"
-        );
-
-        // 选择本地：以云端最新版本 2 为基线上传，成功后版本 3。
-        server.set_handler(Box::new(|req| {
-            if req.method == "GET" {
-                json_response(200, &snapshot("[]", 2, None))
-            } else if req.method == "PUT" {
-                json_response(200, &put_ok(3))
-            } else {
-                json_response(404, r#"{"code":"not_found","message":"no"}"#)
-            }
-        }));
-        choose_local(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Synced }).await,
-            "选择本地后应 synced"
-        );
-        let reqs = server.requests();
-        let puts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT").collect();
-        assert_eq!(puts.len(), puts_before + 1, "只应新增一次上传");
-        let last_put = puts.last().unwrap();
-        assert!(
-            last_put.body.contains("\"baseVersion\":2"),
-            "{}",
-            last_put.body
-        );
-        assert_eq!(known_of(&st).await, Some(3));
-        assert!(!st.core.lock().await.meta.dirty);
-    }
-
-    /// 计划 P3 门禁：结果未知的 PUT（响应丢失）不得被当作成功，也不得盲目覆盖。
-    /// 服务器已应用首个 PUT（v2→v3）但断开连接；客户端置 failed、保留 dirty 与基线；
-    /// 重试沿用原基线 → 409 → 冲突挂起，本地数据完整。
-    #[tokio::test]
-    async fn put_result_unknown_retries_same_base_then_conflicts_without_overwrite() {
-        use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-
-        let version = Arc::new(AtomicI64::new(2));
-        let v_get = version.clone();
-        let v_put = version.clone();
-        let server = Scripted::spawn(Box::new(move |req| {
-            if req.method == "GET" {
-                let v = v_get.load(AtomicOrdering::SeqCst);
-                if v >= 3 {
-                    // 首个 PUT 已在服务端生效：云端出现“本地”内容，版本推进。
-                    json_response(
-                        200,
-                        &snapshot(
-                            r#"[{"id":"44444444-4444-4444-4444-444444444444","text":"已应用的本地事项","done":false,"createdAt":"2026-09-08T00:00:00Z","dueDate":null,"updatedAt":"2026-09-08T00:00:00Z"}]"#,
-                            v,
-                            None,
-                        ),
-                    )
-                } else {
-                    json_response(200, &snapshot("[]", v, None))
-                }
-            } else if req.method == "PUT" {
-                let cur = v_put.load(AtomicOrdering::SeqCst);
-                if cur == 2 {
-                    v_put.store(3, AtomicOrdering::SeqCst); // 服务器已应用……
-                    Resp { status: 0, body: String::new() } // ……但响应丢失
-                } else {
-                    json_response(
-                        409,
-                        &format!(
-                            r#"{{"code":"snapshot_conflict","message":"changed","currentVersion":{cur}}}"#
-                        ),
-                    )
-                }
-            } else {
-                json_response(404, r#"{"code":"not_found","message":"no"}"#)
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "本地-结果未知").await;
-        // 模拟真实本地变更入口（seed 直插 store 不置脏；retry driver 依赖 dirty）。
-        st.engine.write().await.dirty = true;
-        st.core.lock().await.meta.dirty = true;
-
-        flush(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Failed }).await,
-            "响应丢失应进入 failed 等待重试"
-        );
-        {
-            let core = st.core.lock().await;
-            assert!(core.meta.dirty, "结果未知不得清除 dirty");
-            assert_eq!(core.meta.known_server_version, Some(2), "不得假设版本推进");
-            assert!(
-                core.store.items().iter().any(|i| i.text == "本地-结果未知"),
-                "本地数据不得丢失"
-            );
-        }
-        assert_eq!(known_of(&st).await, Some(2), "内存基线保持 2");
-
-        // 重试：沿原基线重发 → 服务端 409 → 拉最新云端 → 冲突挂起。
-        retry_tick(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Conflict }).await,
-            "重试应转入冲突（不盲写）"
-        );
-        let reqs = server.requests();
-        let put_bodies: Vec<&String> = reqs
-            .iter()
-            .filter(|r| r.method == "PUT")
-            .map(|r| &r.body)
-            .collect();
-        assert_eq!(put_bodies.len(), 2, "重试恰好一次 PUT");
-        assert!(
-            put_bodies[1].contains("\"baseVersion\":2"),
-            "重试必须沿用原基线：{}",
-            put_bodies[1]
-        );
-        {
-            let e = st.engine.read().await;
-            assert_eq!(e.conflict.as_ref().map(|c| c.version), Some(3));
-        }
-        let core = st.core.lock().await;
-        assert!(
-            core.store.items().iter().any(|i| i.text == "本地-结果未知"),
-            "冲突挂起后本地数据仍完整"
-        );
-    }
-
-    #[tokio::test]
-    async fn choose_cloud_replaces_local_and_adopts_version() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        // GET 返回云端候选（version 9，含 1 条）；PUT 因基线过期返回 409。
-        let server = Scripted::spawn(Box::new(|req| {
-            if req.method == "GET" {
-                json_response(
-                    200,
-                    &snapshot(
-                        r#"[{"id":"44444444-4444-4444-4444-444444444444","text":"cloud","done":false,"createdAt":"2026-09-08T00:00:00Z","dueDate":null,"updatedAt":"2026-09-08T00:00:00Z"}]"#,
-                        9,
-                        None,
-                    ),
-                )
-            } else {
-                json_response(
-                    409,
-                    r#"{"code":"snapshot_conflict","message":"conflict","currentVersion":9}"#,
-                )
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "本地要丢的").await;
-        flush(&st).await;
-        let conflicted =
-            wait_until(|| async { state_of(&st).await == SyncStateView::Conflict }).await;
-        assert!(conflicted, "应进入冲突态");
-        let cloud = { st.engine.read().await.conflict.clone().unwrap() };
-        assert_eq!(cloud.version, 9);
-        choose_cloud(&st, &cloud).await;
-        let core = st.core.lock().await;
-        assert_eq!(core.store.items().len(), 1, "本地已被云端替换");
-        assert_eq!(core.store.items()[0].text, "cloud");
-        assert_eq!(core.meta.known_server_version, Some(9));
-        assert_eq!(core.store.undo_title(), None, "云端替换清空历史");
-    }
-
-    #[tokio::test]
-    async fn auth_failure_clears_credentials_and_enters_unauthorized() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|_req| {
-            json_response(
-                401,
-                r#"{"code":"invalid_token","message":"invalid or expired token"}"#,
-            )
-        }));
-        login_like(&st, &server.url, creds.clone()).await;
-        seed_item(&st, "x").await;
-        flush(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Unauthorized }).await,
-            "鉴权失败应进入 unauthorized"
-        );
-        assert!(creds.load().is_err(), "凭据应被清除");
-        assert!(!st.auth.lock().await.logged_in);
-    }
-
-    #[tokio::test]
-    async fn failure_enters_failed_and_retry_driver_recovers() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|_req| {
-            json_response(503, r#"{"code":"service_unavailable","message":"down"}"#)
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "x").await;
-        // 模拟“本地有未上传修改”的真实入口：置 dirty（retry driver 依赖它）。
-        st.engine.write().await.dirty = true;
-        st.core.lock().await.meta.dirty = true;
-        st.engine.write().await.known_version = Some(0);
-        flush(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Failed }).await,
-            "应进入 failed"
-        );
-        server.set_handler(Box::new(|_req| json_response(200, &put_ok(5))));
-        retry_tick(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Synced }).await,
-            "重试驱动应恢复 synced"
-        );
-        assert_eq!(known_of(&st).await, Some(5));
-    }
-
-    #[tokio::test]
-    async fn automatic_sync_off_keeps_local_then_manual_flush_works() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|req| {
-            if req.method == "GET" {
-                json_response(200, SNAPSHOT_EMPTY)
-            } else {
-                json_response(200, &put_ok(7))
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        st.core.lock().await.settings.automatic_sync = false;
-        seed_item(&st, "仅本地").await;
-        on_core_mutated(&st).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(server.requests_matching(|r| r.method == "PUT"), 0, "自动同步关闭不应上传");
-        flush(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Synced }).await,
-            "手动同步应成功"
-        );
-        assert_eq!(server.requests_matching(|r| r.method == "PUT"), 1);
-    }
-
-    #[tokio::test]
-    async fn session_reset_discards_inflight_result() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|_req| {
-            std::thread::sleep(Duration::from_millis(600));
-            json_response(200, &put_ok(11))
-        }));
-        login_like(&st, &server.url, creds.clone()).await;
-        seed_item(&st, "x").await;
-        st.engine.write().await.known_version = Some(0);
-        flush(&st).await;
-        let started = wait_until(|| async { server.requests_matching(|r| r.method == "PUT") == 1 })
-            .await;
-        assert!(started, "PUT 应已发出");
-        session_reset(&st).await;
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        assert!(creds.load().is_err());
-        let e = st.engine.read().await;
-        assert_eq!(e.state, SyncStateView::Idle);
-        assert_eq!(e.known_version, None);
-        assert_eq!(e.conflict, None);
-        drop(e);
-        assert_eq!(st.core.lock().await.meta.known_server_version, None);
-    }
-
-    #[tokio::test]
-    async fn restart_resume_same_owner_dirty_uploads() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|req| {
-            if req.method == "GET" {
-                json_response(200, &snapshot("[]", 4, None))
-            } else {
-                json_response(200, &put_ok(5))
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        // 模拟“重启前”的持久化状态：同归属、有未上传修改、已知基线 4。
-        {
-            let mut core = st.core.lock().await;
-            core.store.add("重启前的修改", None, SystemClock.now()).unwrap();
-            core.meta.server_url = Some(server.url.clone());
-            core.meta.username = Some("tester".into());
-            core.meta.dirty = true;
-            core.meta.known_server_version = Some(4);
-        }
-        st.engine.write().await.dirty = true;
-        st.engine.write().await.known_version = Some(4);
-        crate::auth::resume_after_restart(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Synced }).await,
-            "同归属重启应自动续传"
-        );
-        assert_eq!(server.requests_matching(|r| r.method == "PUT"), 1);
-        assert_eq!(known_of(&st).await, Some(5));
-    }
-
-    #[tokio::test]
-    async fn restart_resume_unowned_local_enters_conflict_without_upload() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|req| {
-            if req.method == "GET" {
-                json_response(
-                    200,
-                    &snapshot(
-                        r#"[{"id":"55555555-5555-5555-5555-555555555555","text":"cloud","done":false,"createdAt":"2026-09-08T00:00:00Z","dueDate":null,"updatedAt":"2026-09-08T00:00:00Z"}]"#,
-                        6,
-                        None,
-                    ),
-                )
-            } else {
-                json_response(200, &put_ok(7))
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "无归属本地数据").await;
-        // meta 无归属（username/server_url 为空）→ 必须交用户选择。
-        crate::auth::resume_after_restart(&st).await;
-        assert!(
-            wait_until(|| async { state_of(&st).await == SyncStateView::Conflict }).await,
-            "无归属恢复应转冲突"
-        );
-        assert_eq!(
-            server.requests_matching(|r| r.method == "PUT"),
-            0,
-            "无归属数据不得自动上传"
-        );
-    }
-
-    #[tokio::test]
-    async fn restore_with_midflight_edits_becomes_conflict_candidate() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        // 云端恢复的 GET 故意放慢，期间本地发生编辑。
-        let server = Scripted::spawn(Box::new(|req| {
-            if req.method == "GET" {
-                std::thread::sleep(Duration::from_millis(350));
-                json_response(
-                    200,
-                    &snapshot(
-                        r#"[{"id":"66666666-6666-6666-6666-666666666666","text":"cloud","done":false,"createdAt":"2026-09-08T00:00:00Z","dueDate":null,"updatedAt":"2026-09-08T00:00:00Z"}]"#,
-                        9,
-                        None,
-                    ),
-                )
-            } else {
-                json_response(200, &put_ok(10))
-            }
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "本地原始").await;
-        let st2 = st.clone();
-        let restore = tokio::spawn(async move { restore_from_cloud(&st2).await });
-        // 等待 GET 已发出（恢复进行中）。
-        assert!(
-            wait_until(|| async { server.requests_matching(|r| r.method == "GET") >= 1 }).await,
-            "恢复 GET 应已发出"
-        );
-        seed_item(&st, "恢复期间的本地编辑").await;
-        let _ = restore.await;
-        let e = st.engine.read().await;
-        assert_eq!(e.state, SyncStateView::Conflict, "恢复期间编辑应转入冲突");
-        assert_eq!(e.conflict.as_ref().map(|c| c.version), Some(9));
-        drop(e);
-        let core = st.core.lock().await;
-        assert_eq!(core.store.items().len(), 2, "本地新工作必须被保留");
-    }
-
-    #[tokio::test]
-    async fn resume_keeps_pending_conflict_without_any_request() {
-        let (st, creds, _dir) = temp_state();
-        seed_tokens(&creds);
-        let server = Scripted::spawn(Box::new(|_req| {
-            json_response(500, r#"{"code":"internal_error","message":"should not be called"}"#)
-        }));
-        login_like(&st, &server.url, creds).await;
-        seed_item(&st, "本地").await;
-        // 模拟“重启时仍有未决冲突”的持久化情景（状态为内存态，本用例直接置位）。
-        st.engine.write().await.state = SyncStateView::Conflict;
-        crate::auth::resume_after_restart(&st).await;
-        assert_eq!(
-            server.requests().len(),
-            0,
-            "未决冲突在重启后不得发起任何同步请求（更不得自动覆盖）"
-        );
-        assert_eq!(st.engine.read().await.state, SyncStateView::Conflict);
-    }
+async fn prepare_conflict(st: &SyncShared, cloud: SnapshotDto) {
+    let ctx = context(st).await.expect("测试必须建立真实会话");
+    let operation = st.engine.read().await.operation;
+    store_candidate(st, &ctx, operation, cloud, ConflictReason::RemoteChanged)
+        .await
+        .unwrap();
 }
+#[cfg(test)]
+pub async fn session_reset(st: &SyncShared) {
+    crate::auth::reset_for_test(st).await;
+}
+
+#[cfg(test)]
+mod tests;

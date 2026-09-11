@@ -1,6 +1,7 @@
 // 统一 IPC 封装：命令调用 + 事件订阅（载荷类型由 Rust 生成，见 types.ts）。
 
-import { invoke } from '@tauri-apps/api/core'
+import { invoke as nativeInvoke, type InvokeArgs } from '@tauri-apps/api/core'
+import { CommandFailure } from './errors'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   AuthArg,
@@ -10,10 +11,12 @@ import type {
   ConflictView,
   DueArg,
   MigrationStatus,
+  NotificationPermissionView,
   MoveArg,
   SettingsPatch,
   SettingsView,
   SnapshotView,
+  ScrollTargetView,
   StartupView,
   SyncStatePayload,
   TextArg,
@@ -28,7 +31,6 @@ export const EVT = {
   conflict: 'doing://conflict',
   migration: 'doing://migration',
   saveFailed: 'doing://save-failed',
-  scrollToItem: 'doing://scroll-to-item',
   openSettings: 'doing://open-settings',
   windowShown: 'doing://window-shown',
   windowBlurred: 'doing://window-blurred',
@@ -38,6 +40,11 @@ export type Unlisten = UnlistenFn
 
 export async function on<T>(event: string, handler: (payload: T) => void): Promise<Unlisten> {
   return listen<T>(event, (e) => handler(e.payload))
+}
+
+async function invoke<T>(command: string, args?: InvokeArgs): Promise<T> {
+  try { return args === undefined ? await nativeInvoke<T>(command) : await nativeInvoke<T>(command, args) }
+  catch (error) { throw new CommandFailure(error) }
 }
 
 // MARK: 命令
@@ -65,10 +72,10 @@ export const api = {
   authLogout: () => invoke('auth_logout'),
   syncFlush: () => invoke('sync_flush'),
   syncRestore: () => invoke('sync_restore'),
-  conflictChooseLocal: (cloudVersion: number) =>
-    invoke('conflict_choose_local', { arg: { cloudVersion } satisfies CloudChoiceArg }),
-  conflictChooseCloud: (cloudVersion: number) =>
-    invoke('conflict_choose_cloud', { arg: { cloudVersion } satisfies CloudChoiceArg }),
+  conflictChooseLocal: (candidateId: string, cloudVersion: string) =>
+    invoke('conflict_choose_local', { arg: { candidateId, cloudVersion } satisfies CloudChoiceArg }),
+  conflictChooseCloud: (candidateId: string, cloudVersion: string) =>
+    invoke('conflict_choose_cloud', { arg: { candidateId, cloudVersion } satisfies CloudChoiceArg }),
   conflictDefer: () => invoke('conflict_defer'),
   settingsUpdate: (patch: SettingsPatch) => invoke<SettingsView>('settings_update', { patch }),
   settingsReset: () => invoke<SettingsView>('settings_reset'),
@@ -79,8 +86,14 @@ export const api = {
   systemSaveNow: () => invoke<boolean>('system_save_now'),
   systemDataPath: () => invoke<string>('system_data_path'),
   systemRevealData: () => invoke('system_reveal_data'),
-  systemNotifyClicked: (id: number) => invoke('system_notify_clicked', { id }),
-  migrationImport: (source: string) => invoke('migration_import', { source }),
+  notificationPermission: () => invoke<NotificationPermissionView>('notification_permission'),
+  notificationRequestPermission: () => invoke<NotificationPermissionView>('notification_request_permission'),
+  notificationNext: () => invoke<ScrollTargetView | null>('notification_next'),
+  notificationAck: (notificationId: string, sessionGeneration: number) => invoke<void>('notification_ack', { notificationId, sessionGeneration }),
+  migrationImport: (source: string, preferences = false) => invoke<MigrationStatus>('migration_import', { source, preferences }),
+  migrationResume: (transactionId: string) => invoke<MigrationStatus>('migration_resume', { transactionId }),
+  migrationCancel: (transactionId: string) => invoke<MigrationStatus>('migration_cancel', { transactionId }),
+  migrationKeepCurrent: (transactionId: string) => invoke<MigrationStatus>('migration_keep_current', { transactionId }),
   dataExportLegacy: () => invoke<string>('data_export_legacy'),
   launchAtLoginGet: () => invoke<boolean>('launch_at_login_get'),
   launchAtLoginSet: (enabled: boolean) =>
@@ -93,11 +106,10 @@ export const bus = {
   syncState: (fn: (p: SyncStatePayload) => void) => on<SyncStatePayload>(EVT.syncState, fn),
   authState: (fn: (p: AuthStateView) => void) => on<AuthStateView>(EVT.authState, fn),
   settings: (fn: (p: SettingsView) => void) => on<SettingsView>(EVT.settings, fn),
-  sessionLost: (fn: () => void) => on(EVT.sessionLost, fn),
+  sessionLost: (fn: (p: AuthStateView) => void) => on<AuthStateView>(EVT.sessionLost, fn),
   conflict: (fn: (p: ConflictView) => void) => on<ConflictView>(EVT.conflict, fn),
   migration: (fn: (p: MigrationStatus) => void) => on<MigrationStatus>(EVT.migration, fn),
   saveFailed: (fn: (message: string) => void) => on<string>(EVT.saveFailed, fn),
-  scrollToItem: (fn: (id: string) => void) => on<string>(EVT.scrollToItem, fn),
   openSettings: (fn: (section: string) => void) => on<string>(EVT.openSettings, fn),
   windowShown: (fn: () => void) => on(EVT.windowShown, fn),
 }

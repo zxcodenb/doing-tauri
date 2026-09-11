@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-migration-keep-current"
+description = "Enables the migration_keep_current command without any pre-configured scope."
+commands.allow = ["migration_keep_current"]
+
+[[permission]]
+identifier = "deny-migration-keep-current"
+description = "Denies the migration_keep_current command without any pre-configured scope."
+commands.deny = ["migration_keep_current"]

@@ -44,7 +44,9 @@ where
 {
     let opt = Option::<String>::deserialize(deserializer)?;
     match opt {
-        Some(s) => parse_rfc3339(&s).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => parse_rfc3339(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }
@@ -59,7 +61,10 @@ pub struct Item {
     pub done: bool,
     #[serde(serialize_with = "serialize_dt", deserialize_with = "deserialize_dt")]
     pub created_at: DateTime<Utc>,
-    #[serde(serialize_with = "serialize_opt_dt", deserialize_with = "deserialize_opt_dt")]
+    #[serde(
+        serialize_with = "serialize_opt_dt",
+        deserialize_with = "deserialize_opt_dt"
+    )]
     pub due_date: Option<DateTime<Utc>>,
     #[serde(serialize_with = "serialize_dt", deserialize_with = "deserialize_dt")]
     pub updated_at: DateTime<Utc>,
@@ -147,8 +152,14 @@ mod tests {
             updated_at: now,
         };
         let json = serde_json::to_string(&item).unwrap();
-        assert!(json.contains("\"createdAt\":\"2026-09-03T00:00:00Z\""), "{json}");
-        assert!(json.contains("\"dueDate\":\"2026-09-03T00:00:00Z\""), "{json}");
+        assert!(
+            json.contains("\"createdAt\":\"2026-09-03T00:00:00Z\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"dueDate\":\"2026-09-03T00:00:00Z\""),
+            "{json}"
+        );
         let back: Item = serde_json::from_str(&json).unwrap();
         assert_eq!(back, item);
     }

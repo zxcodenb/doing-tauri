@@ -86,7 +86,7 @@ impl Store {
             notified_due_ids: notified,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            revision: 0,
+            revision: data.revision,
         }
     }
 
@@ -137,8 +137,11 @@ impl Store {
             .enumerate()
             .filter(|(_, it)| !it.done && Some(it.id) != focused)
             .collect();
-        let mut scheduled: Vec<(usize, &Item)> =
-            active.iter().copied().filter(|(_, it)| it.due_date.is_some()).collect();
+        let mut scheduled: Vec<(usize, &Item)> = active
+            .iter()
+            .copied()
+            .filter(|(_, it)| it.due_date.is_some())
+            .collect();
         scheduled.sort_by(|a, b| {
             let da = a.1.due_date.unwrap();
             let db = b.1.due_date.unwrap();
@@ -148,8 +151,16 @@ impl Store {
                 da.cmp(&db)
             }
         });
-        let manual: Vec<&Item> = active.iter().filter(|(_, it)| it.due_date.is_none()).map(|(_, it)| *it).collect();
-        scheduled.into_iter().map(|(_, it)| it.clone()).chain(manual.into_iter().cloned()).collect()
+        let manual: Vec<&Item> = active
+            .iter()
+            .filter(|(_, it)| it.due_date.is_none())
+            .map(|(_, it)| *it)
+            .collect();
+        scheduled
+            .into_iter()
+            .map(|(_, it)| it.clone())
+            .chain(manual.into_iter().cloned())
+            .collect()
     }
 
     /// 展示顺序：焦点卡 → 其余未完成（排序）→ 已完成（原顺序）。
@@ -157,7 +168,11 @@ impl Store {
         let focus = self.focused_item().cloned();
         let remaining = self.remaining_items();
         let completed: Vec<Item> = self.completed_items().cloned().collect();
-        focus.into_iter().chain(remaining).chain(completed).collect()
+        focus
+            .into_iter()
+            .chain(remaining)
+            .chain(completed)
+            .collect()
     }
 
     pub fn has_overdue(&self, now: DateTime<Utc>) -> bool {
@@ -201,7 +216,12 @@ impl Store {
     }
 
     /// 新增：焦点为空时新任务自动成为焦点；插入到第一件已完成之前。
-    pub fn add(&mut self, text: impl AsRef<str>, due: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Result<Mutation> {
+    pub fn add(
+        &mut self,
+        text: impl AsRef<str>,
+        due: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Mutation> {
         let text = Self::trimmed(text.as_ref());
         if text.is_empty() {
             return Err(CoreError::NoOp);
@@ -215,7 +235,11 @@ impl Store {
             due_date: due,
             updated_at: now,
         };
-        let insert_at = self.items.iter().position(|it| it.done).unwrap_or(self.items.len());
+        let insert_at = self
+            .items
+            .iter()
+            .position(|it| it.done)
+            .unwrap_or(self.items.len());
         let becomes_focus = self.focused_item().is_none();
         let id = item.id;
         self.items.insert(insert_at, item);
@@ -226,7 +250,12 @@ impl Store {
         Ok(Mutation::new("新增事项", "已添加事项", Some(id)))
     }
 
-    pub fn set_due(&mut self, id: Uuid, due: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Result<Mutation> {
+    pub fn set_due(
+        &mut self,
+        id: Uuid,
+        due: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Mutation> {
         let index = self
             .items
             .iter()
@@ -239,7 +268,11 @@ impl Store {
         self.items[index].due_date = due;
         // 改期后的任务对“新的提醒”重新获得资格。
         self.notified_due_ids.retain(|n| *n != id);
-        let message = if due.is_none() { "已移除截止时间" } else { "已更新截止时间" };
+        let message = if due.is_none() {
+            "已移除截止时间"
+        } else {
+            "已更新截止时间"
+        };
         self.did_mutate(now);
         Ok(Mutation::new("修改截止时间", message, Some(id)))
     }
@@ -251,15 +284,27 @@ impl Store {
             .position(|it| it.id == id)
             .ok_or(CoreError::NotFound)?;
         let was_done = self.items[index].done;
-        self.checkpoint(if was_done { "恢复事项" } else { "完成事项" });
+        self.checkpoint(if was_done {
+            "恢复事项"
+        } else {
+            "完成事项"
+        });
         self.items[index].done = !was_done;
         if !was_done && self.focus_id == Some(id) {
             self.focus_id = None;
         }
-        let message = if was_done { "已恢复到待办" } else { "完成了，又少一件事。" };
+        let message = if was_done {
+            "已恢复到待办"
+        } else {
+            "完成了，又少一件事。"
+        };
         self.did_mutate(now);
         Ok(Mutation::new(
-            if was_done { "恢复事项" } else { "完成事项" },
+            if was_done {
+                "恢复事项"
+            } else {
+                "完成事项"
+            },
             message,
             Some(id),
         ))
@@ -299,10 +344,7 @@ impl Store {
     }
 
     pub fn toggle_focus(&mut self, id: Uuid, now: DateTime<Utc>) -> Result<Mutation> {
-        let exists_active = self
-            .items
-            .iter()
-            .any(|it| it.id == id && !it.done);
+        let exists_active = self.items.iter().any(|it| it.id == id && !it.done);
         if !exists_active {
             return Err(CoreError::InvalidFocus);
         }
@@ -337,7 +379,12 @@ impl Store {
     }
 
     /// 移动未完成任务到另一未完成任务之前。
-    pub fn move_before(&mut self, id: Uuid, target_id: Uuid, now: DateTime<Utc>) -> Result<Mutation> {
+    pub fn move_before(
+        &mut self,
+        id: Uuid,
+        target_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Mutation> {
         if id == target_id {
             return Err(CoreError::NoOp);
         }
@@ -415,11 +462,8 @@ impl Store {
 
     /// 云端替换 / 登出后调用：清除会话历史；提醒记录仅保留“仍存在且截止未变”的条目。
     pub fn replace_all(&mut self, items: Vec<Item>, focus_id: Option<Uuid>) {
-        let previous: std::collections::HashMap<Uuid, Option<DateTime<Utc>>> = self
-            .items
-            .iter()
-            .map(|it| (it.id, it.due_date))
-            .collect();
+        let previous: std::collections::HashMap<Uuid, Option<DateTime<Utc>>> =
+            self.items.iter().map(|it| (it.id, it.due_date)).collect();
         self.notified_due_ids.retain(|id| {
             items
                 .iter()
@@ -463,6 +507,7 @@ impl Store {
     pub fn to_data_file(&self, sync: SyncMeta) -> DataFile {
         DataFile {
             schema_version: crate::data::SCHEMA_VERSION,
+            revision: self.revision,
             items: self.items.clone(),
             focus_id: self.focus_id,
             notified_due_ids: self.notified_due_ids.clone(),
@@ -475,10 +520,10 @@ impl Store {
         self.notified_due_ids.iter().copied().collect()
     }
 
-    pub fn mark_notified(&mut self, id: Uuid, now: DateTime<Utc>) {
+    pub fn mark_notified(&mut self, id: Uuid, _now: DateTime<Utc>) {
         if self.items.iter().any(|it| it.id == id) && !self.notified_due_ids.contains(&id) {
             self.notified_due_ids.push(id);
-            self.did_mutate(now);
+            self.revision += 1;
         }
     }
 
@@ -524,7 +569,10 @@ mod tests {
         s.toggle_done(a, now).unwrap();
         let c = s.add("C", None, now).unwrap().id.unwrap();
         // 插入点 = 第一件已完成的索引（0），已完成/未完成保持“未完成在前”的不变量。
-        assert_eq!(s.items().iter().map(|i| i.id).collect::<Vec<_>>(), vec![c, a, b]);
+        assert_eq!(
+            s.items().iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![c, a, b]
+        );
         // 展示顺序：焦点 C 单独成卡，其余未完成 B，已完成 A 折叠区。
         let ordered: Vec<Uuid> = s.ordered().iter().map(|i| i.id).collect();
         assert_eq!(ordered, vec![c, b, a]);
@@ -549,7 +597,11 @@ mod tests {
         let date = fixed_dt(2027, 1, 15, 0, 0, 0);
         let a = s.add("同一时间 A", Some(date), now).unwrap().id.unwrap();
         let b = s.add("同一时间 B", Some(date), now).unwrap().id.unwrap();
-        let early = s.add("更早", Some(date - chrono::Duration::hours(1)), now).unwrap().id.unwrap();
+        let early = s
+            .add("更早", Some(date - chrono::Duration::hours(1)), now)
+            .unwrap()
+            .id
+            .unwrap();
         let manual = s.add("无日期", None, now).unwrap().id.unwrap();
         let ids: Vec<Uuid> = s.ordered().iter().map(|i| i.id).collect();
         assert_eq!(ids, vec![focus, early, a, b, manual]);
@@ -562,7 +614,8 @@ mod tests {
         let old = at(1_700_000_000);
         let id = s.add("事项", Some(old), now).unwrap().id.unwrap();
         s.mark_notified(id, now);
-        s.set_due(id, Some(old + chrono::Duration::hours(1)), now).unwrap();
+        s.set_due(id, Some(old + chrono::Duration::hours(1)), now)
+            .unwrap();
         assert!(!s.notified_due_ids().contains(&id));
         s.undo(now).unwrap();
         assert_eq!(s.find(id).unwrap().due_date, Some(old));
@@ -638,5 +691,20 @@ mod tests {
         assert_eq!(s.undo_title(), None);
         s.undo(now).unwrap_err(); // 云端替换后历史为空
         assert_eq!(s.items().len(), 1);
+    }
+    #[test]
+    fn reminder_metadata_does_not_change_task_timestamps_or_create_false_cloud_differences() {
+        let mut store = Store::new();
+        let now = chrono::Utc::now();
+        let id = store
+            .add("提醒仅是本机元数据", Some(now), now)
+            .unwrap()
+            .id
+            .unwrap();
+        let before = store.items().to_vec();
+        let revision = store.revision();
+        store.mark_notified(id, now + chrono::Duration::minutes(2));
+        assert_eq!(store.items(), before, "提醒记录不能伪造成云端任务编辑");
+        assert_eq!(store.revision(), revision + 1);
     }
 }

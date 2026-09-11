@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-migration-resume"
+description = "Enables the migration_resume command without any pre-configured scope."
+commands.allow = ["migration_resume"]
+
+[[permission]]
+identifier = "deny-migration-resume"
+description = "Denies the migration_resume command without any pre-configured scope."
+commands.deny = ["migration_resume"]

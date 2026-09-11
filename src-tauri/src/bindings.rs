@@ -20,6 +20,12 @@ fn config() -> TsConfig {
 fn render_all() -> String {
     let cfg = config();
     let parts: Vec<String> = vec![
+        crate::error::CommandError::export_to_string(&cfg).expect("CommandError"),
+        crate::reminder::NotificationPermission::export_to_string(&cfg)
+            .expect("NotificationPermission"),
+        crate::reminder::NotificationPermissionView::export_to_string(&cfg)
+            .expect("NotificationPermissionView"),
+        crate::events::ScrollTargetView::export_to_string(&cfg).expect("ScrollTargetView"),
         crate::events::ItemView::export_to_string(&cfg).expect("ItemView"),
         crate::events::SnapshotView::export_to_string(&cfg).expect("SnapshotView"),
         crate::events::SyncStateView::export_to_string(&cfg).expect("SyncStateView"),
@@ -51,7 +57,14 @@ fn render_all() -> String {
         out.push('\n');
         out.push_str(decl);
     }
-    out
+    // ts-rs 在带字段注释的声明中会生成行尾空格，统一规范化再写入/比较。
+    let mut normalized = out
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized.push('\n');
+    normalized
 }
 
 #[cfg(test)]
@@ -77,8 +90,15 @@ mod tests {
             "notifiedDueIds",
             "unauthorized",
         ] {
-            assert!(expected.contains(probe), "生成物缺少 {probe}：serde rename 未生效？");
+            assert!(
+                expected.contains(probe),
+                "生成物缺少 {probe}：serde rename 未生效？"
+            );
         }
+        assert!(
+            expected.lines().all(|line| line == line.trim_end()),
+            "生成物不能含行尾空格"
+        );
         assert!(
             !expected.contains("import type {"),
             "同文件类型不应产生 import 语句"

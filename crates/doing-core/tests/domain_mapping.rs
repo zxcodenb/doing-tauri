@@ -40,9 +40,19 @@ fn focus_unique_completed_never_focused_and_toggle_bounds() {
     let b = s.add("下一件", None, n).unwrap().id.unwrap();
     s.toggle_focus(b, n).unwrap();
     assert_eq!(s.focused_item().unwrap().id, b);
-    assert_eq!(s.remaining_items().iter().map(|i| i.id).collect::<Vec<_>>(), vec![a]);
+    assert_eq!(
+        s.remaining_items().iter().map(|i| i.id).collect::<Vec<_>>(),
+        vec![a]
+    );
     let ordered = s.ordered();
-    assert_eq!(ordered.len(), ordered.iter().map(|i| i.id).collect::<std::collections::HashSet<_>>().len());
+    assert_eq!(
+        ordered.len(),
+        ordered
+            .iter()
+            .map(|i| i.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    );
     s.toggle_done(b, n).unwrap();
     assert_eq!(s.focus_id(), None);
     assert!(s.toggle_focus(b, n).is_err());
@@ -57,7 +67,11 @@ fn same_due_date_keeps_manual_order() {
     let date = fixed_dt(2026, 9, 5, 9, 0, 0);
     let a = s.add("同一时间 A", Some(date), n).unwrap().id.unwrap();
     let b = s.add("同一时间 B", Some(date), n).unwrap().id.unwrap();
-    let early = s.add("更早", Some(date - Duration::hours(1)), n).unwrap().id.unwrap();
+    let early = s
+        .add("更早", Some(date - Duration::hours(1)), n)
+        .unwrap()
+        .id
+        .unwrap();
     let manual = s.add("无日期", None, n).unwrap().id.unwrap();
     assert_eq!(
         s.ordered().iter().map(|i| i.id).collect::<Vec<_>>(),
@@ -74,14 +88,26 @@ fn move_before_semantics_and_guards() {
     let c = s.add("C", None, n).unwrap().id.unwrap();
     // C 移到 B 之前 → [A, C, B]
     s.move_before(c, b, n).unwrap();
-    assert_eq!(s.items().iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), vec!["A", "C", "B"]);
+    assert_eq!(
+        s.items()
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["A", "C", "B"]
+    );
     // C 已紧邻 B 之前：空操作
     assert!(s.move_before(c, b, n).is_err());
     // A 已紧邻 C 之前：空操作
     assert!(s.move_before(a, c, n).is_err());
     // B 移到 A 之前 → [B, A, C]
     s.move_before(b, a, n).unwrap();
-    assert_eq!(s.items().iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), vec!["B", "A", "C"]);
+    assert_eq!(
+        s.items()
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["B", "A", "C"]
+    );
     // 完成 D 后：已完成条目不能作为移动目标/来源
     let d = s.add("D", None, n).unwrap().id.unwrap();
     s.toggle_done(d, n).unwrap();
@@ -129,7 +155,7 @@ fn stored_data_with_invalid_or_done_focus_clears_it_on_load() {
     let s = Store::from_data(&data);
     assert_eq!(s.focus_id(), None);
     // 同步元数据随 DataFile 保留，由会话层使用。
-    assert_eq!(data.sync.owner(), None);
+    assert_eq!(data.sync.account_owner(), None);
 }
 
 #[test]
@@ -238,14 +264,22 @@ fn repo_roundtrip_preserves_sync_meta_boundary() {
     data.sync = SyncMeta {
         server_url: Some("https://example.test".into()),
         username: Some("demo".into()),
+        account_id: Some("7".into()),
         known_server_version: Some(42),
         dirty: true,
+        ..Default::default()
     };
     repo.save(&data).unwrap();
     match repo.load().unwrap() {
         LoadResult::Loaded(back) => {
-            assert_eq!(back, data);
-            assert_eq!(back.sync.owner().as_deref(), Some("https://example.test#demo"));
+            assert_eq!(*back, data);
+            assert_eq!(
+                back.sync.account_owner(),
+                Some(doing_core::data::AccountOwner {
+                    server_url: "https://example.test".into(),
+                    account_id: "7".into()
+                })
+            );
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -279,7 +313,7 @@ fn scheduled_tasks_preserve_revision_and_dirty_flow() {
     s.redo(n).unwrap();
     assert!(s.is_empty());
     let mut file = s.to_data_file(SyncMeta::default());
-    assert_eq!(file.schema_version, 1);
+    assert_eq!(file.schema_version, doing_core::data::SCHEMA_VERSION);
     let parse = parse_file(&serde_json::to_vec(&file).unwrap());
     match parse {
         FileParse::Data(_) => {}

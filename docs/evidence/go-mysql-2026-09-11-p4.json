@@ -1,0 +1,104 @@
+{
+  "kind": "doing-tauri-isolated-go-mysql-v1",
+  "startedAt": "2026-09-11T02:44:19.454338+00:00",
+  "status": "passed",
+  "evidenceScope": "Rust app state/coordinator + original Go router + isolated MySQL; not native OS/installation acceptance",
+  "serverSourceSha256": "61a2c105493afc0c7d31e0bd2c9ee622294671b0026e805ceeae4f489b7ece33",
+  "versions": {
+    "mysql": "mysqld  Ver 8.4.11 for macos26.6 on arm64 (Homebrew)",
+    "go": "go version go1.26.1 darwin/arm64",
+    "rust": "rustc 1.98.1 (48a229cea 2026-09-01)"
+  },
+  "phases": [
+    {
+      "phase": "workflows",
+      "mysqlPid": 88370,
+      "goPid": 88397,
+      "rustPid": 88399,
+      "passed": true,
+      "cleanShutdown": true,
+      "audit": {
+        "migrations": [
+          1,
+          2,
+          3
+        ],
+        "users": 2,
+        "items": 4,
+        "sharedItemIds": 0,
+        "activeSessions": 3,
+        "revokedSessions": 2,
+        "requests": {
+          "GET /api/v1/health/ready 200": 2,
+          "GET /api/v1/snapshot 200": 18,
+          "GET /api/v1/snapshot 401": 3,
+          "POST /api/v1/auth/login 200": 2,
+          "POST /api/v1/auth/logout 200": 1,
+          "POST /api/v1/auth/refresh 200": 1,
+          "POST /api/v1/auth/refresh 401": 2,
+          "POST /api/v1/auth/register 200": 2,
+          "PUT /api/v1/snapshot 200": 7,
+          "PUT /api/v1/snapshot 409": 3
+        }
+      },
+      "uuidIsolationCheckpoint": {
+        "migrations": [
+          1,
+          2,
+          3
+        ],
+        "users": 2,
+        "items": 6,
+        "sharedItemIds": 3,
+        "activeSessions": 2,
+        "revokedSessions": 2,
+        "requests": {
+          "GET /api/v1/snapshot 200": 14,
+          "GET /api/v1/health/ready 200": 2,
+          "POST /api/v1/auth/refresh 401": 2,
+          "GET /api/v1/snapshot 401": 3,
+          "POST /api/v1/auth/login 200": 1,
+          "POST /api/v1/auth/logout 200": 1,
+          "POST /api/v1/auth/refresh 200": 1,
+          "PUT /api/v1/snapshot 200": 4,
+          "PUT /api/v1/snapshot 409": 2,
+          "POST /api/v1/auth/register 200": 2
+        }
+      }
+    },
+    {
+      "phase": "process-restart",
+      "mysqlPid": 88527,
+      "goPid": 88535,
+      "rustPid": 88536,
+      "passed": true,
+      "cleanShutdown": true,
+      "audit": {
+        "migrations": [
+          1,
+          2,
+          3
+        ],
+        "users": 2,
+        "items": 4,
+        "sharedItemIds": 0,
+        "activeSessions": 5,
+        "revokedSessions": 4,
+        "requests": {
+          "GET /api/v1/health/ready 200": 2,
+          "GET /api/v1/snapshot 200": 5,
+          "GET /api/v1/snapshot 401": 1,
+          "POST /api/v1/auth/login 200": 3,
+          "POST /api/v1/auth/logout 200": 1,
+          "POST /api/v1/auth/refresh 200": 1,
+          "POST /api/v1/auth/refresh 401": 1,
+          "PUT /api/v1/snapshot 200": 1
+        }
+      }
+    }
+  ],
+  "serverSourceUnchanged": true,
+  "allOwnedProcessesStopped": true,
+  "finishedAt": "2026-09-11T02:44:55.790857+00:00",
+  "temporaryFilesRemoved": true
+}

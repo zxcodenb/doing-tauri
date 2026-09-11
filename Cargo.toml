@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/doing-core", "src-tauri"]
+members = ["crates/doing-core", "crates/doing-notifications", "src-tauri"]
 default-members = ["crates/doing-core"]
 
 # 发布优化必须位于 workspace 根（成员包的 profile 会被忽略）。

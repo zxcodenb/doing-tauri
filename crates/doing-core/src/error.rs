@@ -4,6 +4,8 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 
 #[derive(Debug, Error)]
 pub enum CoreError {
+    #[error("请先登录后再操作事项")]
+    AuthenticationRequired,
     #[error("任务不存在")]
     NotFound,
     #[error("操作未生效：内容为空或没有变化")]

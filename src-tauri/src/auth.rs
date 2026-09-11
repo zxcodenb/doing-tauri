@@ -1,258 +1,487 @@
-//! 认证会话：登录/注册/登出、凭据保存、账号归属仲裁触发。
-//! 规则（计划 §4.2/§4.3）：Token 只在系统安全存储；账号或服务地址改变时
-//! 先备份本地数据，未经明确确认不上传、不覆盖。
-
-use std::path::PathBuf;
-
+//! 认证/登出在 engine -> auth -> core 的同一临界区切换会话。
+//! 网络位于锁外；每个完成结果必须仍属于发起它的认证代次。
+use crate::creds::{CredError, SavedSession};
 use crate::engine;
-use crate::events::EVT_AUTH_STATE;
-use crate::net::client::ApiClient;
+use crate::error::CommandError;
+use crate::events::{AuthStateView, EVT_AUTH_STATE, EVT_SESSION_LOST};
+use crate::net::client::{normalize_base_url, ApiClient};
 use crate::net::dto::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, AuthInner};
 use crate::SyncShared;
 
-/// 登录/注册共用流程。`path` 区分 login/register；服务地址由调用方注入（测试可控）。
+pub fn view(auth: &AuthInner, generation: u64, revision: u64) -> AuthStateView {
+    AuthStateView {
+        session_generation: generation,
+        event_revision: revision,
+        logged_in: auth.logged_in,
+        username: auth.username.clone(),
+        server_url: auth.server_url.clone(),
+        is_authenticating: auth.is_authenticating,
+        error: auth.error.clone(),
+    }
+}
+fn install(auth: &mut AuthInner, client: ApiClient) {
+    let identity = &client.lease().expect("认证客户端必须有租约").identity;
+    auth.username = Some(identity.username.clone());
+    auth.server_url = Some(identity.owner.server_url.clone());
+    auth.account_id = Some(identity.owner.account_id.clone());
+    auth.client = Some(client);
+    auth.logged_in = true;
+    auth.is_authenticating = false;
+    auth.error = None;
+}
+fn clear(auth: &mut AuthInner) {
+    auth.client = None;
+    auth.logged_in = false;
+    auth.is_authenticating = false;
+    auth.username = None;
+    auth.server_url = None;
+    auth.account_id = None;
+}
+
+pub(crate) fn reset_for_migration(
+    e: &mut crate::state::EngineInner,
+    auth: &mut AuthInner,
+) -> Result<(), CommandError> {
+    e.bump_session();
+    let result = auth.vault.revoke().map_err(|_| {
+        CommandError::new(
+            "credentialsUnavailable",
+            "无法清理新版凭据，请检查系统安全存储后重试迁移",
+            true,
+        )
+    });
+    clear(auth);
+    auth.error = result.as_ref().err().map(|e| e.message.clone());
+    result
+}
+
 pub async fn authenticate(
     st: SyncShared,
     path: &str,
     server_url: String,
     username: &str,
     password: &str,
-) -> Result<(), String> {
-    {
+) -> Result<(), CommandError> {
+    let username = username.trim();
+    if username.is_empty() || username.len() > 64 {
+        return Err(CommandError::input("用户名必须为 1–64 字节"));
+    }
+    if password.is_empty() || (path.ends_with("/register") && password.len() < 8) {
+        return Err(CommandError::input("请输入密码；注册密码至少 8 字节"));
+    }
+    let client = ApiClient::anonymous(&server_url).map_err(CommandError::from)?;
+    let server_url = client.base_url().to_owned();
+    let generation = {
+        let mut e = st.engine.write().await;
         let mut auth = st.auth.lock().await;
+        if st.core.lock().await.migration.blocks_writes() {
+            return Err(crate::migrate::problem(
+                "migrationPending",
+                "请先完成、撤销或处理旧版导入，再登录",
+            ));
+        }
         if auth.is_authenticating {
             return Err("正在连接，请稍候".into());
         }
-        auth.is_authenticating = true;
-    }
-    let username = username.trim().to_string();
-    let creds = st.auth.lock().await.creds.clone();
-    let client = ApiClient::new(server_url.clone(), creds);
-    let result = client.auth(path, &username, password).await;
-
-    let mut auth = st.auth.lock().await;
-    auth.is_authenticating = false;
-    match result {
-        Ok(tokens) => {
-            // 凭据只进系统安全存储；不可用时可见报错，绝不回退明文。
-            if auth.creds.save(&tokens).is_err() {
-                auth.creds.clear();
-                return Err("系统安全存储不可用，无法保存登录状态".into());
-            }
-            let (prior_owner, local_nonempty) = {
-                let core = st.core.lock().await;
-                (core.meta.owner(), !core.store.is_empty())
-            };
-            let new_owner = format!("{server_url}#{username}");
-            let owner_changed = prior_owner.as_deref() != Some(new_owner.as_str());
-
-            // 账号归属变化且本地有数据：先做可回滚备份，再进入仲裁（不自动上传）。
-            if local_nonempty && owner_changed {
-                if let Some(prior) = &prior_owner {
-                    archive_current_data(&st, prior).await;
-                }
-            }
-
-            auth.client = Some(client);
-            auth.logged_in = true;
-            auth.username = Some(username.clone());
-            auth.server_url = Some(server_url.clone());
+        if auth.logged_in {
+            return Err("请先退出当前账号".into());
+        }
+        e.bump_session();
+        clear(&mut auth);
+        auth.error = None;
+        if auth.vault.revoke().is_err() {
+            auth.error = Some("系统安全存储不可用，无法安全开始新会话".into());
+            let error =
+                CommandError::new("credentialsUnavailable", auth.error.clone().unwrap(), true);
+            let payload = view(&auth, e.session_generation, st.next_event_revision());
             drop(auth);
-
-            // 引擎进入全新会话代次。
-            st.engine.write().await.bump_session();
-            emit_auth(&st).await;
-            engine::emit_snapshot(&st).await;
-
-            // 本地为空：直接声明归属；否则由仲裁对话框决定归属。
-            if !local_nonempty {
-                claim_owner(&st).await;
-            }
-            let st2 = st.clone();
-            tokio::spawn(async move { resolve_initial(&st2, new_owner).await });
-            Ok(())
-        }
-        Err(ApiError::Unauthorized) => {
-            auth.logged_in = false;
-            Err("用户名或密码不正确".into())
-        }
-        Err(error) => {
-            auth.logged_in = false;
-            Err(error.display_message().to_string())
-        }
-    }
-}
-
-/// 把当前数据文件复制为带归属说明的归档（可回滚，不删除）。
-async fn archive_current_data(st: &AppState, prior_owner: &str) {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let n = st
-        .owner_archive_counter
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let tag = prior_owner.replace(['/', '#', ':'], "_");
-    let source = st.repo.path();
-    let target = PathBuf::from(format!(
-        "{}.owner-backup-{stamp}-{n}.{tag}",
-        source.display()
-    ));
-    if source.exists() {
-        let _ = std::fs::copy(source, target);
-    }
-}
-
-/// 登录后的首次仲裁：沿用“四组合”；本地非空且归属变化/无归属时不自动上传。
-async fn resolve_initial(st: &SyncShared, new_owner: String) {
-    let Some(client) = st.auth.lock().await.client.clone() else {
-        return;
-    };
-    let (owner_server, owner_user) = new_owner
-        .split_once('#')
-        .unwrap_or((new_owner.as_str(), ""));
-    let epoch = {
-        let mut e = st.engine.write().await;
-        e.bump_generation();
-        e.epoch
-    };
-    let local_empty = st.core.lock().await.store.is_empty();
-    let local_owned_by = st.core.lock().await.meta.owner();
-
-    match client.get_snapshot().await {
-        Err(ApiError::Unauthorized | ApiError::RefreshFailed) => {
-            engine::handle_auth_lost(st).await;
-        }
-        Err(error) => {
-            let mut e = st.engine.write().await;
-            e.state = crate::events::SyncStateView::Failed;
-            e.last_error = Some(error.display_message().to_string());
             drop(e);
-            engine::emit_sync_state(st).await;
+            let _ = engine::try_emit(&st, EVT_AUTH_STATE, payload);
+            return Err(error);
         }
-        Ok(cloud) => {
-            if engine::is_stale_public(st, epoch).await {
-                return;
-            }
-            let cloud_empty = cloud.items.is_empty();
-            if local_empty {
-                engine::claim_owner_public(st).await;
-                if cloud_empty {
-                    engine::mark_synced(st, cloud.version).await;
-                } else {
-                    engine::choose_cloud(st, &cloud).await;
-                }
-                return;
-            }
-            let _ = (owner_server, owner_user);
-            // 本地非空：归属一致且云端为空 → 自动上传（四组合之三）。
-            let safe_auto_push =
-                cloud_empty && local_owned_by.as_deref() == Some(new_owner.as_str());
-            if safe_auto_push {
-                engine::set_known_version(st, cloud.version).await;
-                engine::flush(st).await;
-                return;
-            }
-            // 其余（云端有数据 / 归属变化 / 无归属数据）：交用户选择。
-            engine::prepare_conflict(st, cloud).await;
+        auth.is_authenticating = true;
+        st.core.lock().await.store.clear_history();
+        e.session_generation
+    };
+    emit_auth(&st).await;
+    let response = client.auth(path, username, password).await;
+    let mut e = st.engine.write().await;
+    let mut auth = st.auth.lock().await;
+    if e.session_generation != generation || !auth.is_authenticating {
+        // 返回的 Token 不进入任何仓库，也不能撤销现在登录的账户。
+        if let Ok(tokens) = response {
+            tokio::spawn(async move {
+                let _ = client.logout(&tokens.refresh).await;
+            });
         }
+        return Err("登录请求已取消".into());
     }
+    e.bump_session();
+    auth.is_authenticating = false;
+    let outcome: Result<(), CommandError> = match response {
+        Ok(tokens) => match SavedSession::new(&server_url, tokens) {
+            Ok(saved) => {
+                let mut core = st.core.lock().await;
+                let foreign = (!core.store.is_empty() || core.meta.dirty)
+                    && !core.meta.belongs_to(&saved.identity.owner);
+                if foreign && st.repo.archive_current().is_err() {
+                    Err(CommandError::persistence(
+                        "无法备份原账号本地数据，尚未切换账号",
+                    ))
+                } else if let Err(error) = crate::migrate::acknowledge_new_login(&st, &mut core) {
+                    Err(error)
+                } else {
+                    match auth.vault.activate(saved) {
+                        Ok(lease) => {
+                            install(&mut auth, ApiClient::authenticated(lease));
+                            engine::refresh_view(
+                                &mut e,
+                                &core,
+                                auth.client
+                                    .as_ref()
+                                    .and_then(|c| c.lease())
+                                    .map(|l| &l.identity.owner),
+                            );
+                            Ok(())
+                        }
+                        Err(_) => Err(CommandError::new(
+                            "credentialsUnavailable",
+                            "系统安全存储不可用，无法保存登录状态",
+                            true,
+                        )),
+                    }
+                }
+            }
+            Err(_) => Err(CommandError::new(
+                "invalidResponse",
+                "服务器返回的账号凭据无效",
+                false,
+            )),
+        },
+        Err(ApiError::Unauthorized) => Err(CommandError::new(
+            "unauthorized",
+            "用户名或密码不正确",
+            false,
+        )),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(message) = &outcome {
+        clear(&mut auth);
+        auth.error = Some(message.message.clone());
+    }
+    let accepted_generation = e.session_generation;
+    drop(auth);
+    drop(e);
+    emit_auth(&st).await;
+    engine::emit_snapshot(&st).await;
+    engine::emit_sync_state(&st).await;
+    if outcome.is_ok() {
+        crate::migrate::probe_and_emit(&st).await;
+        tokio::spawn(async move {
+            engine::bootstrap(&st, accepted_generation).await;
+        });
+    }
+    outcome
 }
 
-/// 登出：本地先清（凭据/会话），服务端撤销尽力而为。
-pub async fn logout(st: &SyncShared) {
-    let (refresh_token, client) = {
-        let auth = st.auth.lock().await;
-        (auth.creds.load().ok().map(|t| t.refresh), auth.client.clone())
-    };
-    engine::session_reset(st).await;
-    if let (Some(token), Some(client)) = (refresh_token, client) {
-        let _ = client.logout(&token).await;
+/// expected 用于拒绝迟到的鉴权失败；None 是用户明确登出。
+async fn reset(
+    st: &SyncShared,
+    expected: Option<(u64, uuid::Uuid)>,
+    message: Option<String>,
+    remote_logout: bool,
+) -> Result<(), CommandError> {
+    let mut e = st.engine.write().await;
+    let mut auth = st.auth.lock().await;
+    if let Some((generation, id)) = expected {
+        if e.session_generation != generation
+            || auth.client.as_ref().and_then(ApiClient::session_id) != Some(id)
+        {
+            return Ok(());
+        }
     }
-    emit_auth(st).await;
+    let remote = auth
+        .client
+        .clone()
+        .and_then(|c| c.lease()?.load().ok().map(|t| (c, t.refresh)));
+    e.bump_session();
+    let clear_error = auth
+        .vault
+        .revoke()
+        .err()
+        .map(|_| "当前会话已退出，但系统凭据删除失败；请检查权限后重试".to_owned());
+    clear(&mut auth);
+    auth.error = clear_error.clone().or_else(|| message.clone());
+    let mut core = st.core.lock().await;
+    // 数据归属、dirty、已确认基线及未决冲突保留；只清除会话内历史。
+    core.store.clear_history();
+    e.dirty = core.meta.dirty;
+    e.state = if message.is_some() {
+        crate::events::SyncStateView::Unauthorized
+    } else {
+        crate::events::SyncStateView::Idle
+    };
+    e.last_error = auth.error.clone();
+    let payload = view(&auth, e.session_generation, st.next_event_revision());
+    drop(core);
+    drop(auth);
+    drop(e);
+    let _ = engine::try_emit(st, EVT_AUTH_STATE, payload.clone());
+    if message.is_some() {
+        let _ = engine::try_emit(st, EVT_SESSION_LOST, payload);
+    }
+    engine::emit_snapshot(st).await;
+    engine::emit_sync_state(st).await;
+    if remote_logout {
+        if let Some((client, refresh)) = remote {
+            tokio::spawn(async move {
+                let _ = client.logout(&refresh).await;
+            });
+        }
+    }
+    clear_error.map_or(Ok(()), |message| {
+        Err(CommandError::new("credentialsUnavailable", message, true))
+    })
+}
+pub async fn logout(st: &SyncShared) -> Result<(), CommandError> {
+    reset(st, None, None, true).await
+}
+pub async fn lose_session(st: &SyncShared, generation: u64, id: uuid::Uuid, error: &ApiError) {
+    let _ = reset(
+        st,
+        Some((generation, id)),
+        Some(error.display_message().to_owned()),
+        false,
+    )
+    .await;
+}
+#[cfg(test)]
+pub async fn reset_for_test(st: &SyncShared) {
+    reset(st, None, None, false).await.unwrap();
 }
 
 pub async fn emit_auth(st: &SyncShared) {
-    let payload = {
-        let auth = st.auth.lock().await;
-        crate::events::AuthStateView {
-            logged_in: auth.logged_in,
-            username: auth.username.clone(),
-            server_url: auth.server_url.clone(),
-            is_authenticating: auth.is_authenticating,
-        }
-    };
-    let _ = crate::engine::try_emit(st, EVT_AUTH_STATE, payload);
+    let e = st.engine.read().await;
+    let auth = st.auth.lock().await;
+    let payload = view(&auth, e.session_generation, st.next_event_revision());
+    drop(auth);
+    drop(e);
+    let _ = engine::try_emit(st, EVT_AUTH_STATE, payload);
 }
-
-/// 声明数据归属为当前账号（本地为空或用户确认保留本地后调用）。
-pub async fn claim_owner(st: &SyncShared) {
-    engine::claim_owner_public(st).await;
-}
-
-/// 重启恢复：凭据已在（logged_in）时按归属与状态决定自动续传/云端恢复/冲突挂起。
-/// 规则（计划 §4.3）：同归属才允许自动上传；无归属或归属不同的本地数据必须先经用户选择。
 pub async fn resume_after_restart(st: &SyncShared) {
-    if !st.auth.lock().await.logged_in {
+    let generation = st.engine.read().await.session_generation;
+    engine::bootstrap(st, generation).await;
+}
+
+/// setup / 测试的真实重载路径：身份只从受保护的凭据记录恢复，绝不从任务归属猜测。
+pub fn restore_credentials(st: &AppState, server_url: &str) {
+    let mut e = st.engine.blocking_write();
+    let mut auth = st.auth.blocking_lock();
+    e.bump_session();
+    clear(&mut auth);
+    if st.core.blocking_lock().migration.requires_login() {
+        auth.error = Some("旧版导入后需重新登录；迁移前会话不会恢复".into());
         return;
     }
-    if st.engine.read().await.state == crate::events::SyncStateView::Conflict {
-        return; // 保持未决冲突挂起，绝不自动覆盖。
-    }
-    let Some(client) = st.auth.lock().await.client.clone() else {
-        return;
-    };
-    let (local_empty, dirty, owner_match) = {
-        // 全局锁序约定：先 auth 后 core（与 authenticate 保持一致，避免 ABBA）。
-        let auth = st.auth.lock().await;
-        let core = st.core.lock().await;
-        let owner_match = auth.username.is_some()
-            && core.meta.username == auth.username
-            && core.meta.server_url == auth.server_url;
-        (core.store.is_empty(), core.meta.dirty, owner_match)
-    };
-    let epoch = {
-        let mut e = st.engine.write().await;
-        e.bump_generation();
-        e.epoch
-    };
-    match client.get_snapshot().await {
-        Err(ApiError::Unauthorized | ApiError::RefreshFailed) => {
-            engine::handle_auth_lost(st).await;
-        }
+    let server_url = match normalize_base_url(server_url) {
+        Ok(url) => url,
         Err(error) => {
-            let mut e = st.engine.write().await;
-            e.state = crate::events::SyncStateView::Failed;
-            e.last_error = Some(error.display_message().to_string());
-            drop(e);
-            engine::emit_sync_state(st).await;
-            // dirty 场景由 retry_driver 继续重试。
+            auth.error = Some(error.display_message().to_owned());
+            return;
         }
-        Ok(cloud) => {
-            if engine::is_stale_public(st, epoch).await {
-                return;
+    };
+    match auth.vault.restore(&server_url) {
+        Ok(lease) => install(&mut auth, ApiClient::authenticated(lease)),
+        Err(CredError::Unavailable) => {
+            auth.error = Some("系统安全存储不可用，请检查权限后重新登录".into())
+        }
+        Err(_) => {}
+    }
+    let core = st.core.blocking_lock();
+    engine::refresh_view(
+        &mut e,
+        &core,
+        auth.client
+            .as_ref()
+            .and_then(|c| c.lease())
+            .map(|l| &l.identity.owner),
+    );
+}
+
+#[cfg(test)]
+pub async fn install_test_session(
+    st: &AppState,
+    server_url: &str,
+    tokens: crate::net::dto::AuthDto,
+) {
+    let mut e = st.engine.write().await;
+    let mut auth = st.auth.lock().await;
+    let lease = auth
+        .vault
+        .activate(SavedSession::new(server_url, tokens).unwrap())
+        .unwrap();
+    e.bump_session();
+    install(&mut auth, ApiClient::authenticated(lease));
+    let core = st.core.lock().await;
+    engine::refresh_view(
+        &mut e,
+        &core,
+        auth.client
+            .as_ref()
+            .and_then(ApiClient::lease)
+            .map(|l| &l.identity.owner),
+    );
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use crate::creds::{memory::MemoryStore, CredentialStore};
+    use crate::net::test_server::{json_response, Gate, Scripted, SNAPSHOT_EMPTY};
+    use std::sync::Arc;
+
+    fn state() -> (SyncShared, Arc<MemoryStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = Arc::new(MemoryStore::default());
+        let st = Arc::new(AppState::new(dir.path().into(), None, creds.clone()));
+        (st, creds, dir)
+    }
+
+    #[tokio::test]
+    async fn late_login_after_logout_does_not_resurrect_session() {
+        let (st, creds, _dir) = state();
+        let gate = Gate::new();
+        let response_gate = gate.clone();
+        let server = Scripted::spawn(Box::new(move |req| {
+            if req.path.ends_with("/login") {
+                response_gate.wait();
+                json_response(
+                    200,
+                    &serde_json::to_string(&crate::net::test_server::tokens_for(
+                        1, "alice", "late",
+                    ))
+                    .unwrap(),
+                )
+            } else {
+                json_response(200, SNAPSHOT_EMPTY)
             }
-            let cloud_empty = cloud.items.is_empty();
-            if local_empty {
-                if cloud_empty {
-                    engine::mark_synced(st, cloud.version).await;
+        }));
+        let task = {
+            let st = st.clone();
+            let url = server.url.clone();
+            tokio::spawn(async move {
+                authenticate(st, "api/v1/auth/login", url, "alice", "password123").await
+            })
+        };
+        server.wait_for(|r| r.path.ends_with("/login"), 1).await;
+        engine::session_reset(&st).await;
+        gate.release();
+        let _ = task.await.unwrap();
+        assert!(!st.auth.lock().await.logged_in, "迟到登录响应不能重新登录");
+        assert!(creds.load().is_err(), "登出后不得保存迟到的凭据");
+    }
+
+    #[tokio::test]
+    async fn late_refresh_after_logout_does_not_recreate_credentials() {
+        let (st, creds, _dir) = state();
+        let gate = Gate::new();
+        let response_gate = gate.clone();
+        let server = Scripted::spawn(Box::new(move |req| {
+            if req.path.ends_with("/refresh") {
+                response_gate.wait();
+                json_response(
+                    200,
+                    &serde_json::to_string(&crate::net::test_server::tokens_for(
+                        1, "alice", "late",
+                    ))
+                    .unwrap(),
+                )
+            } else if req.bearer.as_deref()
+                == Some(
+                    crate::net::test_server::tokens_for(1, "alice", "old")
+                        .access
+                        .as_str(),
+                )
+            {
+                json_response(401, r#"{"code":"unauthorized","message":"expired"}"#)
+            } else {
+                json_response(200, SNAPSHOT_EMPTY)
+            }
+        }));
+        install_test_session(
+            &st,
+            &server.url,
+            crate::net::test_server::tokens_for(1, "alice", "old"),
+        )
+        .await;
+        let client = st.auth.lock().await.client.clone().unwrap();
+        let task = tokio::spawn(async move { client.get_snapshot().await });
+        server.wait_for(|r| r.path.ends_with("/refresh"), 1).await;
+        engine::session_reset(&st).await;
+        gate.release();
+        let _ = task.await.unwrap();
+        assert!(creds.load().is_err(), "迟到刷新不能重建已登出的凭据");
+    }
+    #[tokio::test]
+    async fn late_account_a_login_cannot_replace_canonical_account_b_credentials() {
+        let (st, creds, _dir) = state();
+        st.core.lock().await.settings.automatic_sync = false;
+        let gate = Gate::new();
+        let response_gate = gate.clone();
+        let server = Scripted::spawn(Box::new(move |req| {
+            if req.path.ends_with("/login") {
+                if req.body.contains("alice") {
+                    response_gate.wait();
+                    json_response(
+                        200,
+                        &serde_json::to_string(&crate::net::test_server::tokens_for(
+                            1, "Alice", "a",
+                        ))
+                        .unwrap(),
+                    )
                 } else {
-                    engine::choose_cloud(st, &cloud).await;
+                    json_response(
+                        200,
+                        &serde_json::to_string(&crate::net::test_server::tokens_for(
+                            2,
+                            "CanonicalBob",
+                            "b",
+                        ))
+                        .unwrap(),
+                    )
                 }
-                return;
+            } else {
+                json_response(200, SNAPSHOT_EMPTY)
             }
-            if owner_match {
-                if cloud_empty && !dirty {
-                    engine::mark_synced(st, cloud.version).await;
-                    return;
-                }
-                engine::set_known_version(st, cloud.version).await;
-                engine::flush(st).await;
-                return;
-            }
-            // 无归属 / 归属不同的本地数据：交用户选择（不自动上传、不自动覆盖）。
-            engine::prepare_conflict(st, cloud).await;
-        }
+        }));
+        let login_a = {
+            let st = st.clone();
+            let url = server.url.clone();
+            tokio::spawn(async move {
+                authenticate(st, "api/v1/auth/login", url, "alice", "password123").await
+            })
+        };
+        server.wait_for(|r| r.path.ends_with("/login"), 1).await;
+        reset_for_test(&st).await;
+        authenticate(
+            st.clone(),
+            "api/v1/auth/login",
+            server.url.clone(),
+            " bob ",
+            "password456",
+        )
+        .await
+        .unwrap();
+        let session_b = creds.load().unwrap().session_id;
+        gate.release();
+        assert!(login_a.await.unwrap().is_err());
+        assert!(st.auth.lock().await.logged_in);
+        assert_eq!(
+            st.auth.lock().await.username.as_deref(),
+            Some("CanonicalBob")
+        );
+        assert_eq!(creds.load().unwrap().session_id, session_b);
+        assert_eq!(creds.load().unwrap().identity.owner.account_id, "2");
     }
 }

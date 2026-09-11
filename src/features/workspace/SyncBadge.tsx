@@ -27,7 +27,7 @@ function iconOf(state: SyncStateName): { name: IconName; color: string } {
 }
 
 export function SyncBadge() {
-  const { sync, settings } = useDoing()
+  const { sync, settings, conflict, showConflict, run } = useDoing()
   const [open, setOpen] = useState(false)
   if (!sync) return null
   const autoOff = settings && !settings.automaticSync && (sync.state === 'idle' || sync.state === 'synced')
@@ -93,10 +93,13 @@ export function SyncBadge() {
             <div style={{ display: 'flex', gap: 8 }}>
               <ActionButton
                 kind="primary"
-                disabled={!sync || sync.state === 'syncing' || sync.state === 'conflict'}
-                onClick={() => void api.syncFlush()}
+                disabled={sync.state === 'syncing'}
+                onClick={() => {
+                  if (sync.state === 'conflict' && conflict) { showConflict(); setOpen(false) }
+                  else void run(() => api.syncFlush())
+                }}
               >
-                {sync.state === 'failed' ? '重试同步' : '立即同步'}
+                {sync.state === 'conflict' ? (conflict ? '处理冲突' : '重试获取候选') : sync.state === 'failed' ? '重试同步' : '立即同步'}
               </ActionButton>
               <ActionButton onClick={() => void api.systemOpenSettings()}>同步设置</ActionButton>
             </div>

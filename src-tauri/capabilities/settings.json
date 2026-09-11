@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings-close",
+  "description": "仅设置窗口允许通过窗口内快捷键关闭自身；主窗口由 Rust 拦截关闭以保留工作区草稿。",
+  "windows": [
+    "settings"
+  ],
+  "permissions": [
+    "core:window:allow-close"
+  ]
+}

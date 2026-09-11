@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../../lib/ipc'
 import { useDoing } from '../../hooks/useDoing'
+import { useNotificationNavigation } from '../../hooks/useNotificationNavigation'
 import { activeCount, countOverdue, isOverdueNow, orderItems } from '../../lib/ordering'
 import { dueStampText } from '../../lib/time'
 import type { ItemView } from '../../types'
@@ -24,6 +25,8 @@ export function Workspace({ panelMode }: { panelMode: boolean }) {
   const [dueOpen, setDueOpen] = useState(false)
   const rowRefs = useRef(new Map<string, HTMLDivElement>())
   const inputRef = useRef<HTMLInputElement>(null)
+  const { target: notificationTarget, acknowledge } = useNotificationNavigation()
+  const navigationAttempt = useRef('')
 
   const { focus, remaining, completed } = useMemo(
     () => orderItems(snapshot.items, snapshot.focusId),
@@ -34,19 +37,25 @@ export function Workspace({ panelMode }: { panelMode: boolean }) {
   const overdueCount = countOverdue(snapshot.items, now)
   const showOverdueBanner = settings?.showOverdueBanner ?? true
 
-  // 通知/点击定位滚动。
+  // Select/expand first. ACK only after the real row is mounted and scrolled; an early
+  // startup event or a collapsed completed item must not consume an invisible navigation.
   useEffect(() => {
-    const handler = (e: Event) => {
-      const id = (e as CustomEvent<string>).detail
-      if (!id) return
-      const item = snapshot.items.find((i) => i.id === id)
-      if (item?.done) setShowsCompleted(true)
-      setSelectedId(id)
-      rowRefs.current.get(id)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    }
-    window.addEventListener('doing://scroll-to-item', handler)
-    return () => window.removeEventListener('doing://scroll-to-item', handler)
-  }, [snapshot.items])
+    if (!notificationTarget) return
+    const item = snapshot.items.find((entry) => entry.id === notificationTarget.itemId)
+    if (!item) return
+    if (item.done) setShowsCompleted(true)
+    setSelectedId(item.id)
+  }, [notificationTarget, snapshot.items])
+  useEffect(() => {
+    if (!notificationTarget || selectedId !== notificationTarget.itemId) return
+    const row = rowRefs.current.get(notificationTarget.itemId)
+    if (!row) return
+    const key = `${notificationTarget.sessionGeneration}:${notificationTarget.notificationId}:${notificationTarget.eventRevision}`
+    if (navigationAttempt.current === key) return
+    navigationAttempt.current = key
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    void acknowledge(notificationTarget)
+  }, [notificationTarget, selectedId, showsCompleted, snapshot.items, acknowledge])
 
   // 远端替换后清理失效状态；选择越界时收敛。
   useEffect(() => {
@@ -187,6 +196,11 @@ export function Workspace({ panelMode }: { panelMode: boolean }) {
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 20px 8px' }}>
           {focus ? (
             <div
+              tabIndex={-1}
+              ref={(element) => {
+                if (element) rowRefs.current.set(focus.id, element)
+                else rowRefs.current.delete(focus.id)
+              }}
               style={{
                 background: 'var(--focus)',
                 borderRadius: 15,

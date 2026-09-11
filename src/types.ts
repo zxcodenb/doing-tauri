@@ -5,6 +5,10 @@
 import type { SyncStateName } from './types.gen'
 
 export type {
+  CommandError,
+  ScrollTargetView,
+  NotificationPermission,
+  NotificationPermissionView,
   ItemView,
   SnapshotView,
   SyncStateName,

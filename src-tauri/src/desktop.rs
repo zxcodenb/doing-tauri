@@ -19,6 +19,8 @@ use crate::SyncShared;
 
 pub const MAIN_WINDOW: &str = "main";
 pub const SETTINGS_WINDOW: &str = "settings";
+pub(crate) mod placement;
+
 const WINDOW_W: f64 = 380.0;
 const WINDOW_H: f64 = 580.0;
 
@@ -117,15 +119,8 @@ fn build_menu(app: &AppHandle, ms: &MenuState) -> tauri::Result<Menu<tauri::Wry>
         true,
         None::<&str>,
     )?;
-    let clear = MenuItem::with_id(
-        app,
-        "clear",
-        "清除已完成",
-        ms.has_completed,
-        None::<&str>,
-    )?;
-    let sync_status =
-        MenuItem::with_id(app, "sync-status", &ms.sync_text, false, None::<&str>)?;
+    let clear = MenuItem::with_id(app, "clear", "清除已完成", ms.has_completed, None::<&str>)?;
+    let sync_status = MenuItem::with_id(app, "sync-status", &ms.sync_text, false, None::<&str>)?;
     let restore = MenuItem::with_id(
         app,
         "restore",
@@ -216,10 +211,16 @@ pub fn build_tray(app: &AppHandle, state: &SyncShared) -> tauri::Result<()> {
                 tauri::async_runtime::spawn(async move { present_main(&st).await });
             }
             "settings" => {
-                open_settings_window(app);
+                if let Err(error) = open_settings_window(app) {
+                    let _ = engine::try_emit(&st, EVT_SAVE_FAILED, error.message);
+                }
             }
             "pin" => {
-                tauri::async_runtime::spawn(async move { toggle_mode(&st).await });
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = toggle_mode(&st).await {
+                        let _ = engine::try_emit(&st, EVT_SAVE_FAILED, error.message);
+                    }
+                });
             }
             "clear" => {
                 tauri::async_runtime::spawn(async move {
@@ -239,7 +240,9 @@ pub fn build_tray(app: &AppHandle, state: &SyncShared) -> tauri::Result<()> {
                 });
             }
             "logout" => {
-                tauri::async_runtime::spawn(async move { auth::logout(&st).await });
+                tauri::async_runtime::spawn(async move {
+                    let _ = auth::logout(&st).await;
+                });
             }
             "reveal" => {
                 reveal_data_file(st.as_ref());
@@ -254,6 +257,7 @@ pub fn build_tray(app: &AppHandle, state: &SyncShared) -> tauri::Result<()> {
 }
 
 fn menu_state_blocking(st: &AppState) -> MenuState {
+    let logged_in = st.auth.blocking_lock().logged_in;
     let e = st.engine.blocking_read();
     let core = st.core.blocking_lock();
     let conflict = if e.conflict.is_some() {
@@ -266,7 +270,7 @@ fn menu_state_blocking(st: &AppState) -> MenuState {
         sync_text: format!("同步状态：{}{}", e.state.display_text(), conflict),
         has_conflict: e.conflict.is_some(),
         syncing: e.state == SyncStateView::Syncing,
-        logged_in: st.auth.blocking_lock().logged_in,
+        logged_in,
         mode_panel: core.settings.mode_is_panel(),
         has_completed: core.store.has_completed(),
         focus_text: core.store.focus_text().map(str::to_owned),
@@ -314,7 +318,10 @@ pub async fn toggle_main(st: &SyncShared) {
 }
 
 pub async fn is_visible(st: &SyncShared) -> bool {
-    let Some(window) = main_window(&st.handle()) else {
+    let Some(handle) = st.try_handle() else {
+        return false;
+    };
+    let Some(window) = main_window(&handle) else {
         return false;
     };
     window.is_visible().unwrap_or(false)
@@ -338,7 +345,10 @@ pub async fn present_main(st: &SyncShared) {
 }
 
 pub async fn dismiss_main(st: &SyncShared) {
-    save_window_origin(st).await;
+    if let Err(error) = save_window_origin(st).await {
+        let _ = crate::engine::try_emit(st, crate::events::EVT_SAVE_FAILED, error.message);
+        return;
+    }
     let Some(window) = main_window(&st.handle()) else {
         return;
     };
@@ -346,117 +356,134 @@ pub async fn dismiss_main(st: &SyncShared) {
 }
 
 async fn position_window(st: &SyncShared, window: &tauri::WebviewWindow) {
-    let panel = st.core.lock().await.settings.mode_is_panel();
-    // 多显示器：monitor 坐标为全局物理坐标（可能带偏移与负值），定位必须叠加原点。
-    if !panel {
-        if let Ok(Some(monitor)) = window.current_monitor() {
-            let (x, y) = popover_origin(
-                (monitor.position().x, monitor.position().y),
-                (monitor.size().width, monitor.size().height),
-                monitor.scale_factor(),
-            );
-            let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-        }
-        return;
+    let (panel, saved) = {
+        let core = st.core.lock().await;
+        (core.settings.mode_is_panel(), core.window_origin)
+    };
+    let monitors = window.available_monitors().unwrap_or_default();
+    let areas: Vec<_> = monitors.iter().map(placement::WorkArea::from).collect();
+    let fallback = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .map(|monitor| placement::WorkArea::from(&monitor))
+        .or_else(|| areas.first().copied());
+    let logical_size = window
+        .outer_size()
+        .ok()
+        .zip(
+            window
+                .scale_factor()
+                .ok()
+                .filter(|scale| scale.is_finite() && (0.25..=8.0).contains(scale)),
+        )
+        .map(|(size, scale)| {
+            (
+                f64::from(size.width) / scale,
+                f64::from(size.height) / scale,
+            )
+        })
+        .unwrap_or((WINDOW_W, WINDOW_H));
+    let position = if panel {
+        saved
+            .and_then(|origin| placement::restore(origin, &areas, logical_size))
+            .or_else(|| fallback.and_then(|area| placement::centered(area, logical_size)))
+    } else {
+        fallback.and_then(|area| placement::popover_fallback(area, logical_size))
+    };
+    if let Some(position) = position {
+        let _ = window.set_position(position.position());
+    } else {
+        // No trustworthy geometry is available; let the OS choose rather than replay an unsafe origin.
+        let _ = window.center();
     }
-    if let Some((x, y)) = load_window_origin(st) {
-        if let Ok(Some(monitor)) = window.current_monitor() {
-            let (x, y) = clamp_origin(
-                (x, y),
-                (monitor.position().x, monitor.position().y),
-                (monitor.size().width, monitor.size().height),
-            );
-            let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-        }
-    }
-}
-
-/// 菜单栏形态定位：贴当前显示器右上（叠加显示器全局原点；支持负坐标副屏）。
-fn popover_origin(origin: (i32, i32), size: (u32, u32), scale: f64) -> (i32, i32) {
-    let width = WINDOW_W * scale;
-    let height = WINDOW_H * scale;
-    let x = (origin.0 as f64 + size.0 as f64 - width - 24.0 * scale).max(origin.0 as f64) as i32;
-    let y = (origin.1 as f64 + size.1 as f64 - height - 12.0 * scale).max(origin.1 as f64) as i32;
-    (x, y)
-}
-
-/// 浮窗恢复位置：收敛到当前显示器可见区域（含原点偏移）。
-fn clamp_origin(saved: (i32, i32), origin: (i32, i32), size: (u32, u32)) -> (i32, i32) {
-    let max_x = origin.0 + size.0.saturating_sub(WINDOW_W as u32) as i32;
-    let max_y = origin.1 + size.1.saturating_sub(WINDOW_H as u32) as i32;
-    (saved.0.clamp(origin.0, max_x), saved.1.clamp(origin.1, max_y))
 }
 
 /// 切换形态（草稿/编辑状态由前端持有，不受影响）。
-pub async fn toggle_mode(st: &SyncShared) {
-    let panel = !st.core.lock().await.settings.mode_is_panel();
-    set_mode(st, panel).await;
+pub async fn toggle_mode(st: &SyncShared) -> Result<bool, crate::error::CommandError> {
+    save_window_origin(st).await?;
+    let view = crate::preferences::update(st, |settings| {
+        settings.mode = if settings.mode_is_panel() {
+            "popover"
+        } else {
+            "panel"
+        }
+        .into();
+        Ok(())
+    })
+    .await?;
+    Ok(view.mode == "panel")
 }
 
-pub async fn set_mode(st: &SyncShared, panel: bool) {
-    let was_visible = is_visible(st).await;
-    dismiss_main(st).await;
-    {
-        let mut core = st.core.lock().await;
-        core.settings.mode = if panel { "panel" } else { "popover" }.into();
-        persist_settings(st.as_ref(), &core.settings);
-    }
-    let view = {
-        let core = st.core.lock().await;
-        SettingsView::from(&core.settings)
-    };
-    let _ = st.handle().emit(EVT_SETTINGS, view);
-    refresh_tray(st).await;
-    if was_visible {
+pub async fn apply_mode_after_commit(st: &SyncShared) {
+    if st.try_handle().is_some() && is_visible(st).await {
         present_main(st).await;
     }
 }
 
-// MARK: - 位置记忆
-
-fn origin_path(st: &AppState) -> std::path::PathBuf {
-    st.settings_repo
-        .path()
-        .parent()
-        .unwrap()
-        .join("window.json")
-}
-
-fn load_window_origin(st: &AppState) -> Option<(i32, i32)> {
-    let data = std::fs::read_to_string(origin_path(st)).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-    Some((v.get("x")?.as_i64()? as i32, v.get("y")?.as_i64()? as i32))
-}
-
-async fn save_window_origin(st: &SyncShared) {
-    let panel = st.core.lock().await.settings.mode_is_panel();
-    if !panel {
-        return;
+// MARK: - 位置记忆（与设置共用原子偏好仓库）
+async fn save_window_origin(st: &SyncShared) -> Result<(), crate::error::CommandError> {
+    if !st.core.lock().await.settings.mode_is_panel() {
+        return Ok(());
     }
-    let Some(window) = main_window(&st.handle()) else {
-        return;
+    let Some(handle) = st.try_handle() else {
+        return Ok(());
     };
-    if let Ok(pos) = window.outer_position() {
-        write_origin_file(st.as_ref(), pos.x, pos.y);
-    }
-}
-
-fn write_origin_file(st: &AppState, x: i32, y: i32) {
-    let path = origin_path(st);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let value = serde_json::json!({ "x": x, "y": y });
-    let _ = std::fs::write(path, serde_json::to_string_pretty(&value).unwrap());
+    let Some(window) = main_window(&handle) else {
+        return Ok(());
+    };
+    let position = window.outer_position().map_err(|_| {
+        crate::error::CommandError::new("windowUnavailable", "无法读取窗口位置", true)
+    })?;
+    crate::preferences::save_origin(
+        st,
+        crate::preferences::WindowOrigin {
+            x: position.x,
+            y: position.y,
+        },
+    )
+    .await
 }
 
 // MARK: - 设置窗口 / 数据文件 / 持久化 / 退出
 
-pub fn open_settings_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
-        let _ = window.show();
-        let _ = window.set_focus();
+pub fn open_settings_window(app: &AppHandle) -> Result<(), crate::error::CommandError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static OPENING: AtomicBool = AtomicBool::new(false);
+    // 不在 UI 线程等待另一线程的窗口创建（它可能正等待 UI 线程），避免互锁。
+    if OPENING.swap(true, Ordering::SeqCst) {
+        return Ok(());
     }
+    struct Opening;
+    impl Drop for Opening {
+        fn drop(&mut self) {
+            OPENING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _opening = Opening;
+    let failure =
+        || crate::error::CommandError::new("windowUnavailable", "无法打开设置窗口，请重试", true);
+    let window = if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
+        window
+    } else {
+        tauri::WebviewWindowBuilder::new(
+            app,
+            SETTINGS_WINDOW,
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .title("Doing 设置")
+        .inner_size(760.0, 610.0)
+        .min_inner_size(620.0, 480.0)
+        .resizable(true)
+        .decorations(true)
+        .visible(false)
+        .center()
+        .build()
+        .map_err(|_| failure())?
+    };
+    window.show().map_err(|_| failure())?;
+    window.set_focus().map_err(|_| failure())
 }
 
 pub fn reveal_data_file(st: &AppState) {
@@ -464,58 +491,29 @@ pub fn reveal_data_file(st: &AppState) {
     let _ = tauri_plugin_opener::OpenerExt::opener(&st.handle()).reveal_item_in_dir(&path);
 }
 
-/// 设置持久化（偏好独立于任务数据）。
-pub fn persist_settings(st: &AppState, settings: &doing_core::AppSettings) {
-    let path = st.settings_repo.path();
-    match serde_json::to_vec_pretty(settings) {
-        Ok(bytes) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(tmp, path);
-            }
-        }
-        Err(e) => eprintln!("[settings] 序列化失败: {e}"),
-    }
-}
-
 pub async fn quit_async(st: &SyncShared) {
-    save_window_origin(st).await;
-    let data = st.core.lock().await.to_data_file();
-    let path = st.repo.path().to_path_buf();
-    let _ = doing_core::repo::JsonRepo::new(&path).save(&data);
-    st.handle().exit(0);
+    if st.core.lock().await.migration.blocks_writes() {
+        // The durable journal, not the fenced/possibly empty UI state, is the restart authority.
+        // Never write that UI state over a partially published target merely to quit.
+        if let Some(handle) = st.try_handle() {
+            handle.exit(0);
+        }
+        return;
+    }
+    if let Err(error) = save_window_origin(st).await {
+        let _ = crate::engine::try_emit(st, crate::events::EVT_SAVE_FAILED, error.message);
+        return;
+    }
+    // 复用同一个串行仓库；失败时留在应用内让用户恢复/导出，不能吞错后退出。
+    if engine::save_now(st).await {
+        st.handle().exit(0);
+    } else {
+        present_main(st).await;
+    }
 }
 
 /// 启动后的环境探测与首轮提醒（供 lib.rs setup 使用）。
 pub async fn post_startup(st: &SyncShared) {
     migrate::probe_and_emit(st).await;
     reminder::refresh(st).await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{clamp_origin, popover_origin};
-
-    #[test]
-    fn popover_origin_respects_monitor_offset_and_negative_axis() {
-        // 第二块 1920×1080 @ (1470, -93)：贴该屏右上。
-        assert_eq!(popover_origin((1470, -93), (1920, 1080), 1.0), (2986, 395));
-        // 位于主屏上方、负 Y 偏移的副屏。
-        assert_eq!(popover_origin((0, -1080), (1920, 1080), 1.0), (1516, -592));
-        // Retina 主屏 2x。
-        assert_eq!(popover_origin((0, 0), (2940, 1912), 2.0), (2132, 728));
-    }
-
-    #[test]
-    fn clamp_origin_keeps_window_visible_on_offset_monitor() {
-        // 已在外接屏内：原样保留。
-        assert_eq!(clamp_origin((2000, 300), (1470, -93), (1920, 1080)), (2000, 300));
-        // 超出右下：收敛到屏内边界。
-        assert_eq!(clamp_origin((5000, 5000), (1470, -93), (1920, 1080)), (3010, 407));
-        // 落在屏左上之外（负向）：x 收敛到原点，y=0 本就在屏内（屏从 -93 起）。
-        assert_eq!(clamp_origin((0, 0), (1470, -93), (1920, 1080)), (1470, 0));
-    }
 }

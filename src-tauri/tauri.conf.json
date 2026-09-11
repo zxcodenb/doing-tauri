@@ -27,18 +27,6 @@
         "shadow": true,
         "center": false,
         "alwaysOnTop": false
-      },
-      {
-        "label": "settings",
-        "title": "Doing 设置",
-        "width": 760,
-        "height": 610,
-        "resizable": true,
-        "maximizable": true,
-        "minimizable": true,
-        "decorations": true,
-        "visible": false,
-        "center": true
       }
     ],
     "security": {
@@ -47,7 +35,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "category": "Productivity",
     "shortDescription": "一个轻巧的地方，放下惦记，专注眼前。",
     "longDescription": "Doing 是一个常驻菜单栏/托盘的任务应用：当前焦点、截止时间、到期提醒与多设备快照同步。",

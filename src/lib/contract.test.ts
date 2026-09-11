@@ -13,7 +13,7 @@ function read(rel: string): string {
 const eventsRs = read('../../src-tauri/src/events.rs')
 const libRs = read('../../src-tauri/src/lib.rs')
 const buildRs = read('../../src-tauri/build.rs')
-const capabilities = read('../../src-tauri/capabilities/default.json')
+const capabilities = read('../../src-tauri/capabilities/default.json') + read('../../src-tauri/capabilities/notifications.json')
 const typesTs = read('../types.ts')
 const typesGenTs = read('../types.gen.ts')
 const ipcTs = read('../lib/ipc.ts')
@@ -103,4 +103,32 @@ describe('Rust ↔ TypeScript 契约', () => {
     // capability 显式授权每条命令（未授权=运行期拒绝）。
     expect(allowed).toEqual(manifest)
   })
+  it('通知定位读取和 ACK 只授权给主工作区，前端没有伪造系统点击入口', () => {
+    const scoped = JSON.parse(read('../../src-tauri/capabilities/notifications.json'))
+    expect(scoped.windows).toEqual(['main'])
+    expect(scoped.permissions).toEqual(['allow-notification-next', 'allow-notification-ack'])
+    const shared = JSON.parse(read('../../src-tauri/capabilities/default.json')).permissions
+    expect(shared).not.toContain('allow-notification-next')
+    expect(shared).not.toContain('allow-notification-ack')
+    expect(ipcTs).not.toContain('system_notify_clicked')
+    expect(capabilities).not.toContain('notification:')
+  })
+  it('Windows 安装方案只登记应用专用通知协议，运行时不抢占 URL 协议', () => {
+    const config = JSON.parse(read('../../src-tauri/tauri.windows.conf.json'))
+    const scheme = /ACTIVATION_SCHEME: &str = "([^"]+)"/.exec(read('../../src-tauri/src/reminder.rs'))?.[1]
+    expect(config.plugins['deep-link'].desktop.schemes).toEqual([scheme])
+    expect(config.bundle.targets).toEqual(['nsis'])
+    expect(config.bundle.windows.nsis.installMode).toBe('currentUser')
+    expect(libRs).not.toMatch(/\.register_all\(/)
+    expect(libRs).toContain('parse_activation_uri')
+  })
+  it('设置窗口不得在启动配置中预载，按需创建并允许单独关闭', () => {
+    const config = JSON.parse(read('../../src-tauri/tauri.conf.json'))
+    expect(config.app.windows.map((window: { label: string }) => window.label)).toEqual(['main'])
+    expect(read('../../src-tauri/src/desktop.rs')).toContain('WebviewWindowBuilder::new')
+    const capability = JSON.parse(read('../../src-tauri/capabilities/settings.json'))
+    expect(capability.windows).toEqual(['settings'])
+    expect(capability.permissions).toEqual(['core:window:allow-close'])
+  })
+
 })

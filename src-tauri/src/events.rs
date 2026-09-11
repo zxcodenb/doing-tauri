@@ -16,7 +16,6 @@ pub const EVT_CONFLICT: &str = "doing://conflict";
 pub const EVT_MIGRATION: &str = "doing://migration";
 pub const EVT_SAVE_FAILED: &str = "doing://save-failed";
 pub const EVT_OPEN_SETTINGS: &str = "doing://open-settings";
-pub const EVT_SCROLL_TO_ITEM: &str = "doing://scroll-to-item";
 
 /// 任务项（展示层只读投影）。
 #[derive(Debug, Clone, Serialize, TS)]
@@ -59,6 +58,8 @@ impl From<&doing_core::Item> for ItemView {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "types.gen.ts")]
 pub struct SnapshotView {
+    pub session_generation: u64,
+    pub event_revision: u64,
     pub revision: u64,
     pub items: Vec<ItemView>,
     #[ts(type = "string | null")]
@@ -71,8 +72,15 @@ pub struct SnapshotView {
 }
 
 impl SnapshotView {
-    pub fn from_store(store: &Store, save_failed: bool) -> Self {
+    pub fn from_store(
+        store: &Store,
+        save_failed: bool,
+        session_generation: u64,
+        event_revision: u64,
+    ) -> Self {
         Self {
+            session_generation,
+            event_revision,
             revision: store.revision(),
             items: store.items().iter().map(ItemView::from).collect(),
             focus_id: store.focus_id(),
@@ -116,11 +124,28 @@ impl SyncStateView {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "../src/types.gen.ts", rename = "SyncStatePayload")]
 pub struct SyncStateViewPayload {
+    pub session_generation: u64,
+    pub event_revision: u64,
     pub state: SyncStateView,
     pub last_sync_at: Option<String>,
     pub last_error: Option<String>,
     pub conflict_cloud_count: Option<usize>,
-    pub conflict_cloud_version: Option<i64>,
+    pub conflict_cloud_version: Option<String>,
+    #[ts(type = "string | null")]
+    pub conflict_id: Option<Uuid>,
+}
+
+/// 原生通知点击定位；旧会话事件不能把新账号 UI 聚焦到相同 UUID 的任务。
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "types.gen.ts")]
+pub struct ScrollTargetView {
+    #[ts(type = "string")]
+    pub notification_id: Uuid,
+    pub session_generation: u64,
+    pub event_revision: u64,
+    #[ts(type = "string")]
+    pub item_id: Uuid,
 }
 
 /// 设置视图（与核心设置字段一一对应）。
@@ -128,6 +153,9 @@ pub struct SyncStateViewPayload {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "types.gen.ts")]
 pub struct SettingsView {
+    pub revision: u64,
+    pub event_revision: u64,
+    pub error: Option<String>,
     #[ts(type = "\"system\" | \"light\" | \"dark\"")]
     pub appearance: String,
     #[ts(type = "\"popover\" | \"panel\"")]
@@ -143,9 +171,13 @@ pub struct SettingsView {
     pub automatic_sync: bool,
 }
 
-impl From<&doing_core::AppSettings> for SettingsView {
-    fn from(s: &doing_core::AppSettings) -> Self {
+impl SettingsView {
+    pub fn from_core(core: &crate::state::CoreInner, event_revision: u64) -> Self {
+        let s = &core.settings;
         Self {
+            revision: core.preferences_revision,
+            event_revision,
+            error: core.preferences_error.clone(),
             appearance: match s.appearance {
                 doing_core::AppAppearance::System => "system",
                 doing_core::AppAppearance::Light => "light",
@@ -171,10 +203,13 @@ impl From<&doing_core::AppSettings> for SettingsView {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "types.gen.ts")]
 pub struct AuthStateView {
+    pub session_generation: u64,
+    pub event_revision: u64,
     pub logged_in: bool,
     pub username: Option<String>,
     pub server_url: Option<String>,
     pub is_authenticating: bool,
+    pub error: Option<String>,
 }
 
 /// 冲突面板展示的云端候选。
@@ -182,16 +217,43 @@ pub struct AuthStateView {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "types.gen.ts")]
 pub struct ConflictView {
-    pub cloud_version: i64,
+    pub session_generation: u64,
+    pub event_revision: u64,
+    #[ts(type = "string")]
+    pub candidate_id: Uuid,
+    pub reason: String,
+    pub cloud_version: String,
     pub cloud_count: usize,
     pub cloud_preview: Vec<ItemView>,
     pub updated_at: Option<String>,
 }
 
 impl ConflictView {
-    pub fn from(snapshot: &crate::net::dto::SnapshotDto) -> Self {
+    pub fn from(
+        candidate: &crate::state::ConflictCandidate,
+        session_generation: u64,
+        event_revision: u64,
+    ) -> Self {
+        let snapshot = &candidate.snapshot;
         Self {
-            cloud_version: snapshot.version,
+            session_generation,
+            event_revision,
+            candidate_id: candidate.id,
+            reason: match candidate.reason {
+                doing_core::data::ConflictReason::Ownership => {
+                    "本地数据尚未归属当前账号，请明确选择后再同步。"
+                }
+                doing_core::data::ConflictReason::LocalChanged => {
+                    "读取云端期间本地有新修改，已保留你的新工作。"
+                }
+                doing_core::data::ConflictReason::UploadUncertain => {
+                    "上次上传结果未能确认，云端版本已变化，请核对两份快照。"
+                }
+                doing_core::data::ConflictReason::Restore => "云端恢复未完成，请确认要保留的快照。",
+                _ => "本地与云端快照不同，请选择保留的版本。",
+            }
+            .into(),
+            cloud_version: snapshot.version.to_string(),
             cloud_count: snapshot.items.len(),
             cloud_preview: snapshot
                 .items

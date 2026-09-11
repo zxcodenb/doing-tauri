@@ -51,6 +51,5 @@ pub fn parse_rfc3339(input: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
         return Ok(dt.with_timezone(&Utc));
     }
     // 兜底：旧文件可能使用无时区的本地时间字符串。
-    DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S")
-        .map(|dt| dt.with_timezone(&Utc))
+    DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S").map(|dt| dt.with_timezone(&Utc))
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-notification-ack"
+description = "Enables the notification_ack command without any pre-configured scope."
+commands.allow = ["notification_ack"]
+
+[[permission]]
+identifier = "deny-notification-ack"
+description = "Denies the notification_ack command without any pre-configured scope."
+commands.deny = ["notification_ack"]

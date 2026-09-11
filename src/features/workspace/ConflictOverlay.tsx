@@ -8,19 +8,24 @@ import { Icon } from '../../components/icons'
 import { formatDateInput } from '../../lib/time'
 
 export function ConflictOverlay() {
-  const { conflict, snapshot, run } = useDoing()
-  const [choice, setChoice] = useState<'local' | 'cloud' | null>(null)
-  if (!conflict) return null
+  const { conflict, conflictOpen, deferConflict, snapshot, run } = useDoing()
+  const [selection, setSelection] = useState<{ candidateId: string; side: 'local' | 'cloud' } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const choice = selection?.candidateId === conflict?.candidateId ? selection?.side : null
+  const setChoice = (side: 'local' | 'cloud' | null) => setSelection(side && conflict ? { candidateId: conflict.candidateId, side } : null)
+  if (!conflict || !conflictOpen) return null
   const localCount = snapshot.items.length
 
   const choose = async () => {
-    if (!choice) return
+    if (!choice || busy) return
+    setBusy(true)
     if (choice === 'local') {
-      await run(() => api.conflictChooseLocal(conflict.cloudVersion))
+      await run(() => api.conflictChooseLocal(conflict.candidateId, conflict.cloudVersion))
     } else {
-      await run(() => api.conflictChooseCloud(conflict.cloudVersion))
+      await run(() => api.conflictChooseCloud(conflict.candidateId, conflict.cloudVersion))
     }
     setChoice(null)
+    setBusy(false)
   }
 
   return (
@@ -72,7 +77,7 @@ export function ConflictOverlay() {
           <div>
             <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text)' }}>保留哪一份？</div>
             <div style={{ fontSize: 12, color: 'var(--text-dim)', lineHeight: 1.5, marginTop: 4 }}>
-              此设备与云端都有事项。请选择一份继续使用，另一份会被替换。
+              {conflict.reason}
             </div>
           </div>
         </div>
@@ -114,15 +119,16 @@ export function ConflictOverlay() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <ActionButton
             kind="secondary"
+            disabled={busy}
             onClick={() => {
               setChoice(null)
-              void run(() => api.conflictDefer())
+              void deferConflict()
             }}
           >
             稍后决定
           </ActionButton>
           <span style={{ flex: 1 }} />
-          <ActionButton kind="primary" disabled={!choice} onClick={() => void choose()}>
+          <ActionButton kind="primary" disabled={!choice || busy} onClick={() => void choose()}>
             {choice === 'local' ? '保留此设备' : choice === 'cloud' ? '使用云端' : '选择后继续'}
           </ActionButton>
         </div>
