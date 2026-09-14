@@ -76,6 +76,14 @@ cargo test -p doing-core -- --nocapture
 - 忽略的类型生成/磁盘满/真实数据库入口与两个私有 kill helper 另行受控执行；迁移 20 + 通知 3 个子进程不重复加算到常规 206 项。
 - 本轮没有安装或运行新 release 产物；详见 [`通知重构证据`](docs/evidence/notifications-2026-09-11.md)。旧 [`P4 证据`](docs/evidence/p4-migration-2026-09-11.md) 保留其历史结果。
 
+### CI 首轮（2026-09-14，不改变上述 P0–P6 未完成结论）
+
+- `main` 上两轮 Actions 5/5 全绿：`a347cee`（工作流入库，run `34794672684`）与 `75d080e`（actions 升到 Node 24 大版本、Windows 校验文件改 LF，run `34795422690`）。
+- 覆盖：前端 **102** 项 Vitest + lint + `tsc/vite`；Rust 核心 55 项 + clippy `-D warnings`；应用层 workspace **206** 项（口径与本地一致，5 项受控 `ignored`）；ts-rs 漂移守卫在 CI 生效。
+- 产物由 runner 构建：arm64 DMG（3.41 MB）与 x64 NSIS（3.02 MB）+ `SHA256SUMS.txt` 作为 artifact 保留 30 天；下载后 `shasum -c` 与 `hdiutil imageinfo` 本机复核通过，两次 run 哈希不同（不宣称可复现构建）。
+- **原生 Windows runner 上完整桌面壳编译 + NSIS 打包通过**，解除 2026-09-11 记录的 macOS 交叉编译 ring/Windows SDK 阻塞；仅构建层，Windows 运行验收仍缺。
+- 边界：产物未签名未公证（不等于 D07）；CI runner 不替代托盘点击、IME、通知横幅、多屏、干净机安装等实机验收（计划 §11.1）；无 universal/Intel 包。详见 [`CI 首轮证据`](docs/evidence/ci-first-run-2026-09-14.md)。
+
 ### 较早原型的历史记录（不作为本轮重写产物的验收）
 
 以下保留既有原型截图、性能和安装演练，不能据此推断当前代码已在原生桌面验证。
@@ -120,8 +128,10 @@ cargo test -p doing-core -- --nocapture
    截图+辅助功能读取+本机 HTTP mock 契约联调，命令/状态机由 Rust 单测覆盖。
 6. 开发地址默认 `http://127.0.0.1:8080`，release 默认 `https://api.invalid.invalid` 占位（不可交付为正式服务）；`DOING_API_URL` 受控环境配置与正式 HTTPS 地址仍待 D06 审查。
 7. 仓库已初始化并推送：`https://github.com/zxcodenb/doing-tauri`（public，`main`）。
-   CI 工作流 `.github/workflows/ci.yml` 因 gh OAuth 缺 `workflow` scope 暂未入库（文件保留在本地，
-   授权后补交一次即可）；P5 的“版本/源码标识”自此可基于 commit 落地。
+   CI 工作流 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 已入库（`a347cee`）并两轮全绿：
+   前端/Rust 核心门禁、macOS 应用层 206 项与 clippy、arm64 DMG 与 x64 NSIS 产物（含 SHA-256）
+   均由 runner 构建；证据见 [`docs/evidence/ci-first-run-2026-09-14.md`](docs/evidence/ci-first-run-2026-09-14.md)。
+   P5 的“版本/源码标识”自此可基于 commit 落地；产物未签名未公证，不代表 D07 通过。
 
 **近期修复记录（均由自动化测试/实机验收驱动）**：
 - 修复同步引擎真实死锁（读锁经 `match` 临时跨 `await`，见上）。
