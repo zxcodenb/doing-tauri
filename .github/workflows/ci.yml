@@ -1,0 +1,145 @@
+# Doing · Tauri 2 CI
+#
+# 目标（对照 doing/docs/tauri2-refactor-plan.md §11.1）：
+# - Rust 核心与前端检查在 CI 运行；
+# - macOS / Windows 各自 runner 构建安装包，产物作为 artifact 供实机安装验收。
+#
+# 边界（不要误读为已通过发布门槛）：
+# - 产物未签名、未公证，仅供内部安装测试，不等于 D07 的可发布产物；
+# - CI runner 不能替代托盘真实点击、IME、通知横幅、多屏等实机验收（计划 §11.1）。
+#
+# 说明：仓库为 public，GitHub 标准 runner 对 public 仓库免费（macOS 10× / Windows 2× 乘数不计费）。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: 前端门禁（lint / Vitest / tsc + vite build）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
+      - run: pnpm test
+      - run: pnpm build
+
+  rust-core:
+    name: Rust 核心门禁（core：test + clippy -D warnings）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p doing-core
+      - run: cargo clippy --locked -p doing-core --all-targets -- -D warnings
+
+  app:
+    name: 应用层门禁（workspace 全量测试 + clippy + 类型漂移守卫）
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      # tauri::generate_context! 在编译期嵌入 frontendDist，必须先产出 dist。
+      - run: pnpm build
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build-macos:
+    name: 构建 macOS 安装包（DMG）
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri:build
+      - name: 生成校验值
+        working-directory: target/release/bundle/dmg
+        run: shasum -a 256 ./*.dmg | tee SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doing-macos-dmg
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/dmg/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  build-windows:
+    name: 构建 Windows 安装包（NSIS）
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri:build
+      - name: 生成校验值
+        working-directory: target/release/bundle/nsis
+        run: |
+          Get-ChildItem *.exe | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Out-File SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doing-windows-nsis
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
